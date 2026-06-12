@@ -187,18 +187,40 @@ router.post('/sync', async (req, res, next) => {
 // ---------------------------------------------------------------------------
 // POST /api/knowledge/query
 // Synchronous RAG query: vector search + LLM answer.
-// Body: { clientId, question, sessionMessages? }
-// Returns: { answer, sources }
+// Body: { clientId, question, sessionId?, sessionMessages? }
+// Returns: { answer, sources, sessionId }
 // ---------------------------------------------------------------------------
 
 router.post('/query', async (req, res, next) => {
   try {
-    const { clientId, question, sessionMessages = [] } = req.body;
+    const { clientId, question, sessionId: providedSessionId, sessionMessages = [] } = req.body;
     if (!clientId || !question) {
       return res.status(400).json({ error: 'clientId and question are required' });
     }
 
     await supabaseService.requireActiveClient(clientId);
+
+    // Resolve or create the chat session
+    let sessionId;
+    if (providedSessionId) {
+      const session = await supabaseService.getChatSession(clientId, providedSessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      sessionId = session.id;
+    } else {
+      const title = question.trim().slice(0, 50);
+      const session = await supabaseService.createChatSession(clientId, title);
+      sessionId = session.id;
+    }
+
+    // Save the user message before running RAG so we have its ID for knowledge gap logging
+    const userMsg = await supabaseService.createChatMessage({
+      clientId,
+      sessionId,
+      role: 'user',
+      content: question,
+    });
 
     // 1. Embed the question
     const queryEmbedding = await openaiService.embedQuery(question);
@@ -210,10 +232,22 @@ router.post('/query', async (req, res, next) => {
     });
 
     if (!chunks.length) {
-      return res.json({
-        answer: 'I couldn\'t find any relevant information in the knowledge base for your question.',
+      const answer = 'I couldn\'t find any relevant information in the knowledge base for your question.';
+      await supabaseService.createChatMessage({
+        clientId,
+        sessionId,
+        role: 'assistant',
+        content: answer,
         sources: [],
       });
+      await supabaseService.createKnowledgeGap({
+        clientId,
+        sessionId,
+        messageId: userMsg.id,
+        question,
+        reason: 'no_chunks_found',
+      });
+      return res.json({ answer, sources: [], sessionId });
     }
 
     // 3. Generate answer
@@ -230,7 +264,118 @@ router.post('/query', async (req, res, next) => {
       }
     }
 
-    res.json({ answer, sources });
+    // 5. Save the assistant message with sources and chunk metadata
+    const metadata = {
+      chunkCount: chunks.length,
+      documentIds: [...new Set(chunks.map((c) => c.document_id))],
+    };
+    await supabaseService.createChatMessage({
+      clientId,
+      sessionId,
+      role: 'assistant',
+      content: answer,
+      sources,
+      metadata,
+    });
+
+    res.json({ answer, sources, sessionId });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/knowledge/chat/sessions/:clientId
+// List all non-deleted sessions for a client (newest first).
+// ---------------------------------------------------------------------------
+
+router.get('/chat/sessions/:clientId', async (req, res, next) => {
+  try {
+    const { clientId } = req.params;
+    await supabaseService.requireActiveClient(clientId);
+    const sessions = await supabaseService.listChatSessions(clientId);
+    res.json({ sessions });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/knowledge/chat/sessions/:clientId/:sessionId/messages
+// Return all non-deleted messages for a session, ordered oldest-first.
+// ---------------------------------------------------------------------------
+
+router.get('/chat/sessions/:clientId/:sessionId/messages', async (req, res, next) => {
+  try {
+    const { clientId, sessionId } = req.params;
+    await supabaseService.requireActiveClient(clientId);
+    const session = await supabaseService.getChatSession(clientId, sessionId);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    const messages = await supabaseService.listChatMessages(clientId, sessionId);
+    res.json({ messages });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /api/knowledge/chat/sessions/:clientId/:sessionId
+// Soft-delete a single session and all its messages.
+// ---------------------------------------------------------------------------
+
+router.delete('/chat/sessions/:clientId/:sessionId', async (req, res, next) => {
+  try {
+    const { clientId, sessionId } = req.params;
+    await supabaseService.requireActiveClient(clientId);
+    const session = await supabaseService.getChatSession(clientId, sessionId);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    await supabaseService.softDeleteChatSession(clientId, sessionId);
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /api/knowledge/chat/history/:clientId
+// Soft-delete all sessions and messages for a client.
+// ---------------------------------------------------------------------------
+
+router.delete('/chat/history/:clientId', async (req, res, next) => {
+  try {
+    const { clientId } = req.params;
+    await supabaseService.requireActiveClient(clientId);
+    await supabaseService.softDeleteAllChatHistory(clientId);
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /api/knowledge/chat/sessions/:clientId/:sessionId/title
+// Rename a session.
+// Body: { title }
+// ---------------------------------------------------------------------------
+
+router.patch('/chat/sessions/:clientId/:sessionId/title', async (req, res, next) => {
+  try {
+    const { clientId, sessionId } = req.params;
+    const { title } = req.body;
+    if (!title) {
+      return res.status(400).json({ error: 'title is required' });
+    }
+    await supabaseService.requireActiveClient(clientId);
+    const session = await supabaseService.getChatSession(clientId, sessionId);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    const updated = await supabaseService.updateChatSessionTitle(clientId, sessionId, title);
+    res.json({ session: updated });
   } catch (err) {
     next(err);
   }

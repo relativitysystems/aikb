@@ -277,6 +277,139 @@ async function searchChunks(clientId, queryEmbedding, { threshold = 0.7, count =
   return data;
 }
 
+// ---------------------------------------------------------------------------
+// Chat sessions
+// ---------------------------------------------------------------------------
+
+async function createChatSession(clientId, title) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_chat_sessions')
+    .insert({ client_id: clientId, title })
+    .select()
+    .single();
+  if (error) throw new Error(`createChatSession: ${error.message}`);
+  return data;
+}
+
+async function getChatSession(clientId, sessionId) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_chat_sessions')
+    .select('*')
+    .eq('id', sessionId)
+    .eq('client_id', clientId)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (error) throw new Error(`getChatSession: ${error.message}`);
+  return data; // null if not found or belongs to a different client
+}
+
+async function listChatSessions(clientId) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_chat_sessions')
+    .select('id, title, created_at, updated_at')
+    .eq('client_id', clientId)
+    .is('deleted_at', null)
+    .order('created_at', { ascending: false });
+  if (error) throw new Error(`listChatSessions: ${error.message}`);
+  return data;
+}
+
+async function updateChatSessionTitle(clientId, sessionId, title) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_chat_sessions')
+    .update({ title, updated_at: new Date().toISOString() })
+    .eq('id', sessionId)
+    .eq('client_id', clientId)
+    .is('deleted_at', null)
+    .select()
+    .single();
+  if (error) throw new Error(`updateChatSessionTitle: ${error.message}`);
+  return data;
+}
+
+async function softDeleteChatSession(clientId, sessionId) {
+  const now = new Date().toISOString();
+  const { error: sessionError } = await aikbSupabase
+    .from('knowledge_chat_sessions')
+    .update({ deleted_at: now, updated_at: now })
+    .eq('id', sessionId)
+    .eq('client_id', clientId);
+  if (sessionError) throw new Error(`softDeleteChatSession: ${sessionError.message}`);
+
+  const { error: msgError } = await aikbSupabase
+    .from('knowledge_chat_messages')
+    .update({ deleted_at: now })
+    .eq('session_id', sessionId)
+    .eq('client_id', clientId);
+  if (msgError) throw new Error(`softDeleteChatSession (messages): ${msgError.message}`);
+}
+
+async function softDeleteAllChatHistory(clientId) {
+  const now = new Date().toISOString();
+  const { error: sessionError } = await aikbSupabase
+    .from('knowledge_chat_sessions')
+    .update({ deleted_at: now, updated_at: now })
+    .eq('client_id', clientId)
+    .is('deleted_at', null);
+  if (sessionError) throw new Error(`softDeleteAllChatHistory (sessions): ${sessionError.message}`);
+
+  const { error: msgError } = await aikbSupabase
+    .from('knowledge_chat_messages')
+    .update({ deleted_at: now })
+    .eq('client_id', clientId)
+    .is('deleted_at', null);
+  if (msgError) throw new Error(`softDeleteAllChatHistory (messages): ${msgError.message}`);
+}
+
+// ---------------------------------------------------------------------------
+// Chat messages
+// ---------------------------------------------------------------------------
+
+async function createChatMessage({ clientId, sessionId, role, content, sources = null, metadata = null }) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_chat_messages')
+    .insert({ client_id: clientId, session_id: sessionId, role, content, sources, metadata })
+    .select()
+    .single();
+  if (error) throw new Error(`createChatMessage: ${error.message}`);
+
+  // Keep the parent session's updated_at current so list ordering reflects activity
+  const { error: sessionError } = await aikbSupabase
+    .from('knowledge_chat_sessions')
+    .update({ updated_at: new Date().toISOString() })
+    .eq('id', sessionId)
+    .eq('client_id', clientId);
+  if (sessionError) throw new Error(`createChatMessage (session update): ${sessionError.message}`);
+
+  return data;
+}
+
+async function listChatMessages(clientId, sessionId) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_chat_messages')
+    .select('*')
+    .eq('client_id', clientId)
+    .eq('session_id', sessionId)
+    .is('deleted_at', null)
+    .order('created_at', { ascending: true });
+  if (error) throw new Error(`listChatMessages: ${error.message}`);
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge gaps
+// ---------------------------------------------------------------------------
+
+async function createKnowledgeGap({ clientId, sessionId, messageId, question, reason }) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_gaps')
+    .insert({ client_id: clientId, session_id: sessionId, message_id: messageId, question, reason })
+    .select()
+    .single();
+  if (error) throw new Error(`createKnowledgeGap: ${error.message}`);
+  return data;
+}
+
 module.exports = {
   downloadFromStorage,
   deleteFromStorage,
@@ -299,4 +432,13 @@ module.exports = {
   searchChunks,
   getGlobalClientById,
   requireActiveClient,
+  createChatSession,
+  getChatSession,
+  listChatSessions,
+  updateChatSessionTitle,
+  softDeleteChatSession,
+  softDeleteAllChatHistory,
+  createChatMessage,
+  listChatMessages,
+  createKnowledgeGap,
 };
