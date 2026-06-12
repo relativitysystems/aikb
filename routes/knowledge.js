@@ -185,6 +185,27 @@ router.post('/sync', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// isKnowledgeGapAnswer
+// Returns true when the LLM answer indicates the question is not covered by
+// the knowledge base, even though some chunks were retrieved (weak matches).
+// ---------------------------------------------------------------------------
+
+function isKnowledgeGapAnswer(answer) {
+  const normalized = answer.toLowerCase();
+  return [
+    'not documented in',
+    'not found in',
+    'couldn\'t find',
+    'could not find',
+    'no information in',
+    'not in the knowledge base',
+    'not available in the knowledge base',
+    'not provided in the documentation',
+    'there is no information',
+  ].some((phrase) => normalized.includes(phrase));
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/knowledge/query
 // Synchronous RAG query: vector search + LLM answer.
 // Body: { clientId, question, sessionId?, sessionMessages? }
@@ -277,6 +298,18 @@ router.post('/query', async (req, res, next) => {
       sources,
       metadata,
     });
+
+    // 6. Log a knowledge gap if the LLM indicated the question wasn't covered,
+    //    even though chunks were retrieved (weak vector matches).
+    if (isKnowledgeGapAnswer(answer)) {
+      await supabaseService.createKnowledgeGap({
+        clientId,
+        sessionId,
+        messageId: userMsg.id,
+        question,
+        reason: 'answer_indicated_not_found',
+      });
+    }
 
     res.json({ answer, sources, sessionId });
   } catch (err) {
