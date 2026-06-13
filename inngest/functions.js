@@ -182,6 +182,9 @@ const deleteDocument = inngest.createFunction(
     const { clientId, documentId: inputDocumentId, sourceFileId, sourceProvider = 'portal_upload' } = event.data;
 
     if (!clientId) throw new Error('clientId is required');
+    if (sourceProvider !== 'portal_upload') {
+      throw new Error('Unsupported sourceProvider. This backend currently supports portal_upload only.');
+    }
 
     // -- Step 1: Find document ------------------------------------------------
     const doc = await step.run('find-document', async () => {

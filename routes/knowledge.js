@@ -126,6 +126,9 @@ router.delete('/document/:id', async (req, res, next) => {
     if (!documentId && !sourceFileId) {
       return res.status(400).json({ error: 'Provide either a document UUID as :id or sourceFileId in the body' });
     }
+    if (sourceProvider !== 'portal_upload') {
+      return res.status(400).json({ error: 'Unsupported sourceProvider. This backend currently supports portal_upload only.' });
+    }
 
     await supabaseService.requireActiveClient(clientId);
 
