@@ -219,10 +219,11 @@ async function deleteChunksForDocument(documentId) {
   console.log(`[deleteChunksForDocument] START | docId=${documentId}`);
   const start = Date.now();
 
-  const query = aikbSupabase
+  const deletePromise = aikbSupabase
     .from('knowledge_chunks')
     .delete()
-    .eq('document_id', documentId);
+    .eq('document_id', documentId)
+    .then((result) => result);
 
   const timeout = new Promise((_, reject) =>
     setTimeout(
@@ -231,11 +232,15 @@ async function deleteChunksForDocument(documentId) {
     )
   );
 
-  const { data, error } = await Promise.race([query, timeout]);
+  const { data, error } = await Promise.race([deletePromise, timeout]);
+
+  if (error) {
+    console.error(`[deleteChunksForDocument] ERROR | docId=${documentId} | elapsed=${Date.now() - start}ms | ${error.message}`);
+    throw new Error(`deleteChunksForDocument: ${error.message}`);
+  }
 
   console.log(`[deleteChunksForDocument] END | docId=${documentId} | elapsed=${Date.now() - start}ms`);
 
-  if (error) throw new Error(`deleteChunksForDocument: ${error.message}`);
   return data;
 }
 
