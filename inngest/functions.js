@@ -9,6 +9,34 @@ const documentParser = require('../services/documentParser');
 const chunkService = require('../services/chunkService');
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function tag(jobId, sourceFileId, documentId) {
+  const parts = [`srcFile=${sourceFileId}`];
+  if (jobId) parts.push(`jobId=${jobId}`);
+  if (documentId) parts.push(`docId=${documentId}`);
+  return parts.join(' | ');
+}
+
+/**
+ * Races a promise against a timeout. Throws with a clear message if the
+ * timeout fires first so the existing catch block can write error_message.
+ */
+function withTimeout(ms, label, promise) {
+  return new Promise((resolve, reject) => {
+    const id = setTimeout(
+      () => reject(new Error(`[ingest] TIMEOUT: ${label} did not complete within ${ms / 1000}s`)),
+      ms
+    );
+    promise.then(
+      (v) => { clearTimeout(id); resolve(v); },
+      (e) => { clearTimeout(id); reject(e); }
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Function 1: knowledge/document.ingest
 //
 // Full ingest pipeline for a single document. Idempotent: re-running with
@@ -58,18 +86,30 @@ const ingestDocument = inngest.createFunction(
 
     try {
       // -- Step 2: Check for existing document (dedup) ------------------------
+      console.log(`[ingest] START check-existing | ${tag(jobId, sourceFileId, documentId)}`);
+      const t2 = Date.now();
       const existing = await step.run('check-existing', async () => {
         return supabaseService.getKnowledgeDocumentBySourceId(clientId, sourceProvider, sourceFileId);
       });
+      console.log(`[ingest] END   check-existing | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t2}ms | found=${!!existing}`);
 
       // -- Step 3: Mark job running -------------------------------------------
+      console.log(`[ingest] START update-job-running | ${tag(jobId, sourceFileId, documentId)}`);
+      const t3 = Date.now();
       await step.run('update-job-running', async () => {
         await supabaseService.updateIngestionJob(job.id, { status: 'running' });
       });
+      console.log(`[ingest] END   update-job-running | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t3}ms`);
 
       // -- Step 4: Fetch document from Supabase Storage -----------------------
+      console.log(`[ingest] START fetch-document | ${tag(jobId, sourceFileId, documentId)} | storagePath=${storagePath}`);
+      const t4 = Date.now();
       const { buffer, resolvedMimeType } = await step.run('fetch-document', async () => {
-        const result = await supabaseService.downloadFromStorage(storagePath);
+        const result = await withTimeout(
+          30_000,
+          'fetch-document / downloadFromStorage',
+          supabaseService.downloadFromStorage(storagePath)
+        );
         if (result.buffer.length > config.maxUploadBytes) {
           throw new Error(`Uploaded file exceeds max size limit of ${config.maxUploadBytes} bytes`);
         }
@@ -77,25 +117,39 @@ const ingestDocument = inngest.createFunction(
         // Buffer doesn't survive Inngest step serialization; convert to base64
         return { buffer: result.buffer.toString('base64'), resolvedMimeType: finalMime };
       });
+      console.log(`[ingest] END   fetch-document | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t4}ms | mime=${resolvedMimeType}`);
 
       // -- Step 5: Parse document to plain text --------------------------------
+      console.log(`[ingest] START parse-document | ${tag(jobId, sourceFileId, documentId)} | mime=${resolvedMimeType}`);
+      const t5 = Date.now();
       const parsed = await step.run('parse-document', async () => {
         const buf = Buffer.from(buffer, 'base64');
-        return documentParser.parseDocument(buf, resolvedMimeType, fileName);
+        return withTimeout(
+          60_000,
+          'parse-document / parseDocument',
+          documentParser.parseDocument(buf, resolvedMimeType, fileName)
+        );
       });
+      console.log(`[ingest] END   parse-document | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t5}ms`);
 
       const parsedText = typeof parsed === 'string' ? parsed : (parsed && parsed.text) || '';
       const parsedPages = (parsed && typeof parsed === 'object' && parsed.pages) || null;
 
+      console.log(`[ingest] parsed text length=${parsedText.length} | pages=${parsedPages ? parsedPages.length : 'n/a'} | ${tag(jobId, sourceFileId, documentId)}`);
+
       if (!parsedText || !parsedText.trim()) throw new Error('Parsed document produced no text');
 
       // -- Step 6: Compute content hash ----------------------------------------
+      console.log(`[ingest] START compute-hash | ${tag(jobId, sourceFileId, documentId)}`);
+      const t6 = Date.now();
       const contentHash = await step.run('compute-hash', async () => {
         return crypto.createHash('sha256').update(parsedText).digest('hex');
       });
+      console.log(`[ingest] END   compute-hash | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t6}ms | hash=${contentHash.slice(0, 12)}...`);
 
       // Content hash dedup
       if (existing && existing.content_hash === contentHash && !forceReindex) {
+        console.log(`[ingest] SKIP unchanged hash | ${tag(jobId, sourceFileId, documentId)}`);
         await step.run('skip-unchanged-by-hash', async () => {
           await supabaseService.updateIngestionJob(job.id, { status: 'completed', documentId: existing.id });
         });
@@ -104,12 +158,16 @@ const ingestDocument = inngest.createFunction(
 
       // -- Step 6b: Cross-file duplicate content check (same client, skipped on forceReindex) --
       if (!forceReindex) {
+        console.log(`[ingest] START check-content-duplicate | ${tag(jobId, sourceFileId, documentId)}`);
+        const t6b = Date.now();
         const contentDuplicate = await step.run('check-content-duplicate', async () => {
           return supabaseService.getIndexedDocumentByContentHash(
             clientId, sourceProvider, contentHash, sourceFileId
           );
         });
+        console.log(`[ingest] END   check-content-duplicate | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t6b}ms | duplicate=${!!contentDuplicate}`);
         if (contentDuplicate) {
+          console.log(`[ingest] SKIP duplicate content | ${tag(jobId, sourceFileId, documentId)}`);
           await step.run('skip-duplicate-content', async () => {
             await supabaseService.updateIngestionJob(job.id, { status: 'completed', documentId: contentDuplicate.id });
           });
@@ -118,6 +176,8 @@ const ingestDocument = inngest.createFunction(
       }
 
       // -- Step 7: Upsert document record --------------------------------------
+      console.log(`[ingest] START upsert-document | ${tag(jobId, sourceFileId, documentId)}`);
+      const t7 = Date.now();
       const doc = await step.run('upsert-document', async () => {
         return supabaseService.upsertKnowledgeDocument(
           clientId,
@@ -130,13 +190,19 @@ const ingestDocument = inngest.createFunction(
         );
       });
       documentId = doc.id;
+      console.log(`[ingest] END   upsert-document | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t7}ms`);
 
       // -- Step 8: Delete old chunks (clean slate for re-index) ----------------
+      console.log(`[ingest] START delete-old-chunks | ${tag(jobId, sourceFileId, documentId)}`);
+      const t8 = Date.now();
       await step.run('delete-old-chunks', async () => {
         await supabaseService.deleteChunksForDocument(documentId);
       });
+      console.log(`[ingest] END   delete-old-chunks | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t8}ms`);
 
       // -- Step 9: Split text into chunks --------------------------------------
+      console.log(`[ingest] START chunk-text | ${tag(jobId, sourceFileId, documentId)}`);
+      const t9 = Date.now();
       const chunks = await step.run('chunk-text', async () => {
         const baseMetadata = { clientId, fileName, sourceProvider, sourceFileId };
         if (parsedPages && parsedPages.length > 0) {
@@ -156,15 +222,25 @@ const ingestDocument = inngest.createFunction(
         }
         return chunkService.chunkText(parsedText, baseMetadata);
       });
+      console.log(`[ingest] END   chunk-text | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t9}ms | chunkCount=${chunks.length}`);
 
       if (!chunks.length) throw new Error('Document produced zero chunks');
 
       // -- Step 10: Generate embeddings ----------------------------------------
+      console.log(`[ingest] START generate-embeddings | ${tag(jobId, sourceFileId, documentId)} | chunkCount=${chunks.length}`);
+      const t10 = Date.now();
       const embeddings = await step.run('generate-embeddings', async () => {
-        return openaiService.generateEmbeddings(chunks.map((c) => c.content));
+        return withTimeout(
+          90_000,
+          'generate-embeddings / generateEmbeddings',
+          openaiService.generateEmbeddings(chunks.map((c) => c.content))
+        );
       });
+      console.log(`[ingest] END   generate-embeddings | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t10}ms | embeddingCount=${embeddings.length}`);
 
       // -- Step 11: Insert chunks with embeddings into Supabase ----------------
+      console.log(`[ingest] START upsert-chunks | ${tag(jobId, sourceFileId, documentId)} | chunkCount=${chunks.length}`);
+      const t11 = Date.now();
       await step.run('upsert-chunks', async () => {
         const rows = chunks.map((chunk, i) => ({
           document_id: documentId,
@@ -176,19 +252,27 @@ const ingestDocument = inngest.createFunction(
         }));
         await supabaseService.insertKnowledgeChunks(rows);
       });
+      console.log(`[ingest] END   upsert-chunks | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t11}ms`);
 
       // -- Step 12: Mark document indexed --------------------------------------
+      console.log(`[ingest] START mark-indexed | ${tag(jobId, sourceFileId, documentId)}`);
+      const t12 = Date.now();
       await step.run('mark-indexed', async () => {
         await supabaseService.markDocumentIndexed(documentId);
       });
+      console.log(`[ingest] END   mark-indexed | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t12}ms`);
 
       // -- Step 13: Complete job -----------------------------------------------
+      console.log(`[ingest] START complete-job | ${tag(jobId, sourceFileId, documentId)}`);
+      const t13 = Date.now();
       await step.run('complete-job', async () => {
         await supabaseService.updateIngestionJob(job.id, { status: 'completed', documentId });
       });
+      console.log(`[ingest] END   complete-job | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t13}ms`);
 
       return { success: true, documentId, chunkCount: chunks.length };
     } catch (err) {
+      console.error(`[ingest] ERROR | ${tag(jobId, sourceFileId, documentId)} | ${err.message}`);
       if (jobId) await supabaseService.logIngestionError(jobId, documentId || null, err);
       if (documentId) {
         await supabaseService.markDocumentError(documentId, err.message).catch((dbErr) => {
