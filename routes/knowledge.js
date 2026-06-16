@@ -246,23 +246,16 @@ router.post('/query', async (req, res, next) => {
 
     // 2. Retrieve relevant chunks scoped to this client
     const chunks = await supabaseService.searchChunks(clientId, queryEmbedding, {
-      threshold: 0.0,
+      threshold: 0.15,
       count: 10,
     });
 
-    console.log('[query] retrieval result', {
+    console.log('[query] retrieval summary', {
       question,
-      clientId,
-      threshold: 0.0,
-      count: 10,
       chunkCount: chunks.length,
-      topChunks: chunks.slice(0, 5).map((chunk) => ({
-        documentId: chunk.document_id,
-        similarity: chunk.similarity,
-        fileName: chunk.metadata?.fileName,
-        pageNumber: chunk.metadata?.pageNumber,
-        preview: chunk.content?.slice(0, 220),
-      })),
+      topScore: chunks[0]?.similarity ?? null,
+      topSource: chunks[0]?.metadata?.fileName ?? null,
+      topPage: chunks[0]?.metadata?.pageNumber ?? null,
     });
 
     if (!chunks.length) {
@@ -286,12 +279,6 @@ router.post('/query', async (req, res, next) => {
 
     // 3. Generate answer
     const answer = await openaiService.generateRagAnswer(question, chunks, sessionMessages);
-
-    console.log('[query] generated answer', {
-      question,
-      isGap: isKnowledgeGapAnswer(answer),
-      answerPreview: answer.slice(0, 350),
-    });
 
     // 4. Build sources list (deduplicated by documentId, with page numbers when available)
     const sourceMap = new Map();

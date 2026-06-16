@@ -287,7 +287,7 @@ async function requireActiveClient(clientId) {
 // Vector search
 // ---------------------------------------------------------------------------
 
-async function searchChunks(clientId, queryEmbedding, { threshold = 0.3, count = 8 } = {}) {
+async function searchChunks(clientId, queryEmbedding, { threshold = 0.15, count = 10 } = {}) {
   const { data, error } = await aikbSupabase.rpc('match_knowledge_chunks', {
     query_embedding: queryEmbedding,
     match_client_id: clientId,
