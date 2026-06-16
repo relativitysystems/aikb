@@ -101,174 +101,174 @@ const ingestDocument = inngest.createFunction(
       });
       console.log(`[ingest] END   update-job-running | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t3}ms`);
 
-      // -- Step 4+5: Fetch and parse (combined so the buffer never enters Inngest step state) --
-      console.log(`[ingest] START fetch-and-parse-document | ${tag(jobId, sourceFileId, documentId)} | storagePath=${storagePath}`);
-      const t45 = Date.now();
-      const { parsed, resolvedMimeType } = await step.run('fetch-and-parse-document', async () => {
-        // Download — 30 s hard timeout
-        const result = await withTimeout(
-          30_000,
-          'fetch-and-parse-document / downloadFromStorage',
-          supabaseService.downloadFromStorage(storagePath)
-        );
-        if (result.buffer.length > config.maxUploadBytes) {
-          throw new Error(`Uploaded file exceeds max size limit of ${config.maxUploadBytes} bytes`);
-        }
-        const finalMime = result.resolvedMimeType || mimeType;
+      // -- Step 4: Core indexing (download → parse → hash → dedup → upsert → chunk → embed → insert) --
+      //
+      // Inngest persists step return values. Keep step outputs small; do not return buffers,
+      // parsed document text, chunks, embeddings, or vector rows.
+      console.log(`[ingest] START index-document-core | ${tag(jobId, sourceFileId, documentId)}`);
+      const tCore = Date.now();
+      const coreResult = await step.run('index-document-core', async () => {
+        let localDocumentId = null;
 
-        // Parse — 60 s hard timeout; buffer stays in local scope only, never serialised
-        const parsedResult = await withTimeout(
-          60_000,
-          'fetch-and-parse-document / parseDocument',
-          documentParser.parseDocument(result.buffer, finalMime, fileName)
-        );
-        return { parsed: parsedResult, resolvedMimeType: finalMime };
-      });
-      console.log(`[ingest] END   fetch-and-parse-document | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t45}ms | mime=${resolvedMimeType}`);
-
-      const parsedText = typeof parsed === 'string' ? parsed : (parsed && parsed.text) || '';
-      const parsedPages = (parsed && typeof parsed === 'object' && parsed.pages) || null;
-
-      console.log(`[ingest] parsed text length=${parsedText.length} | pages=${parsedPages ? parsedPages.length : 'n/a'} | ${tag(jobId, sourceFileId, documentId)}`);
-
-      if (!parsedText || !parsedText.trim()) throw new Error('Parsed document produced no text');
-
-      // -- Step 6: Compute content hash ----------------------------------------
-      console.log(`[ingest] START compute-hash | ${tag(jobId, sourceFileId, documentId)}`);
-      const t6 = Date.now();
-      const contentHash = await step.run('compute-hash', async () => {
-        return crypto.createHash('sha256').update(parsedText).digest('hex');
-      });
-      console.log(`[ingest] END   compute-hash | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t6}ms | hash=${contentHash.slice(0, 12)}...`);
-
-      // Content hash dedup
-      if (existing && existing.content_hash === contentHash && !forceReindex) {
-        console.log(`[ingest] SKIP unchanged hash | ${tag(jobId, sourceFileId, documentId)}`);
-        await step.run('skip-unchanged-by-hash', async () => {
-          await supabaseService.updateIngestionJob(job.id, { status: 'completed', documentId: existing.id });
-        });
-        return { skipped: true, reason: 'content hash unchanged', documentId: existing.id };
-      }
-
-      // -- Step 6b: Cross-file duplicate content check (same client, skipped on forceReindex) --
-      if (!forceReindex) {
-        console.log(`[ingest] START check-content-duplicate | ${tag(jobId, sourceFileId, documentId)}`);
-        const t6b = Date.now();
-        const contentDuplicate = await step.run('check-content-duplicate', async () => {
-          return supabaseService.getIndexedDocumentByContentHash(
-            clientId, sourceProvider, contentHash, sourceFileId
+        try {
+          // Download — 30 s hard timeout
+          const dlResult = await withTimeout(
+            30_000,
+            'index-document-core / downloadFromStorage',
+            supabaseService.downloadFromStorage(storagePath)
           );
-        });
-        console.log(`[ingest] END   check-content-duplicate | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t6b}ms | duplicate=${!!contentDuplicate}`);
-        if (contentDuplicate) {
-          console.log(`[ingest] SKIP duplicate content | ${tag(jobId, sourceFileId, documentId)}`);
-          await step.run('skip-duplicate-content', async () => {
-            await supabaseService.updateIngestionJob(job.id, { status: 'completed', documentId: contentDuplicate.id });
-          });
-          return { skipped: true, reason: 'duplicate content', duplicateOfDocumentId: contentDuplicate.id };
-        }
-      }
+          if (dlResult.buffer.length > config.maxUploadBytes) {
+            throw new Error(`Uploaded file exceeds max size limit of ${config.maxUploadBytes} bytes`);
+          }
+          const resolvedMimeType = dlResult.resolvedMimeType || mimeType;
 
-      // -- Step 7: Upsert document record --------------------------------------
-      console.log(`[ingest] START upsert-document | ${tag(jobId, sourceFileId, documentId)}`);
-      const t7 = Date.now();
-      const doc = await step.run('upsert-document', async () => {
-        return supabaseService.upsertKnowledgeDocument(
-          clientId,
-          sourceProvider,
-          sourceFileId,
-          fileName,
-          resolvedMimeType,
-          contentHash,
-          storagePath || undefined
-        );
-      });
-      documentId = doc.id;
-      console.log(`[ingest] END   upsert-document | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t7}ms`);
+          // Parse — 60 s hard timeout; buffer and parsed text stay local, never serialised
+          const parsedResult = await withTimeout(
+            60_000,
+            'index-document-core / parseDocument',
+            documentParser.parseDocument(dlResult.buffer, resolvedMimeType, fileName)
+          );
+          const parsedText = typeof parsedResult === 'string' ? parsedResult : (parsedResult && parsedResult.text) || '';
+          const parsedPages = (parsedResult && typeof parsedResult === 'object' && parsedResult.pages) || null;
+          const pageCount = parsedPages ? parsedPages.length : 0;
 
-      // -- Step 8: Delete old chunks (clean slate for re-index) ----------------
-      console.log(`[ingest] START delete-old-chunks | ${tag(jobId, sourceFileId, documentId)}`);
-      const t8 = Date.now();
-      await step.run('delete-old-chunks', async () => {
-        await withTimeout(
-          15_000,
-          'delete-old-chunks / deleteChunksForDocument',
-          supabaseService.deleteChunksForDocument(documentId)
-        );
-      });
-      console.log(`[ingest] END   delete-old-chunks | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t8}ms`);
+          console.log(`[ingest] parsed text length=${parsedText.length} | page count=${pageCount || 'n/a'}`);
 
-      // -- Step 9: Split text into chunks --------------------------------------
-      console.log(`[ingest] START chunk-text | ${tag(jobId, sourceFileId, documentId)}`);
-      const t9 = Date.now();
-      const chunks = await step.run('chunk-text', async () => {
-        const baseMetadata = { clientId, fileName, sourceProvider, sourceFileId };
-        if (parsedPages && parsedPages.length > 0) {
-          const allChunks = [];
-          let globalIndex = 0;
-          for (const page of parsedPages) {
-            if (!page.text || !page.text.trim()) continue;
-            const pageChunks = chunkService.chunkText(page.text, {
-              ...baseMetadata,
-              pageNumber: page.pageNumber,
-            });
-            for (const c of pageChunks) {
-              allChunks.push({ ...c, chunkIndex: globalIndex++ });
+          if (!parsedText || !parsedText.trim()) throw new Error('Parsed document produced no text');
+
+          // Content hash
+          const contentHash = crypto.createHash('sha256').update(parsedText).digest('hex');
+
+          // Unchanged hash — skip if same content re-uploaded (uses `existing` from outer step closure)
+          if (existing && existing.content_hash === contentHash && !forceReindex) {
+            console.log(`[ingest] SKIP unchanged hash | ${tag(jobId, sourceFileId, null)}`);
+            await supabaseService.updateIngestionJob(job.id, { status: 'completed', documentId: existing.id });
+            return { skipped: true, reason: 'content hash unchanged', documentId: existing.id, chunkCount: 0, pageCount, contentHash };
+          }
+
+          // Cross-file duplicate content check
+          if (!forceReindex) {
+            const contentDuplicate = await supabaseService.getIndexedDocumentByContentHash(
+              clientId, sourceProvider, contentHash, sourceFileId
+            );
+            if (contentDuplicate) {
+              console.log(`[ingest] SKIP duplicate content | ${tag(jobId, sourceFileId, null)}`);
+              await supabaseService.updateIngestionJob(job.id, { status: 'completed', documentId: contentDuplicate.id });
+              return { skipped: true, reason: 'duplicate content', documentId: contentDuplicate.id, chunkCount: 0, pageCount, contentHash };
             }
           }
-          if (allChunks.length) return allChunks;
+
+          // Upsert document record
+          const doc = await supabaseService.upsertKnowledgeDocument(
+            clientId, sourceProvider, sourceFileId, fileName, resolvedMimeType, contentHash, storagePath || undefined
+          );
+          localDocumentId = doc.id;
+
+          // Delete old chunks — clean slate for re-index (timeout is also enforced inside deleteChunksForDocument)
+          await withTimeout(
+            15_000,
+            'index-document-core / deleteChunksForDocument',
+            supabaseService.deleteChunksForDocument(localDocumentId)
+          );
+
+          // Chunk text — preserve per-page metadata for PDFs
+          const baseMetadata = { clientId, fileName, sourceProvider, sourceFileId };
+          let chunks = [];
+          if (parsedPages && parsedPages.length > 0) {
+            let globalIndex = 0;
+            for (const page of parsedPages) {
+              if (!page.text || !page.text.trim()) continue;
+              const pageChunks = chunkService.chunkText(page.text, { ...baseMetadata, pageNumber: page.pageNumber });
+              for (const c of pageChunks) {
+                chunks.push({ ...c, chunkIndex: globalIndex++ });
+              }
+            }
+          }
+          if (!chunks.length) {
+            chunks = chunkService.chunkText(parsedText, baseMetadata);
+          }
+          console.log(`[ingest] chunk count=${chunks.length}`);
+
+          if (!chunks.length) throw new Error('Document produced zero chunks');
+
+          // Generate embeddings — 90 s hard timeout
+          const embeddings = await withTimeout(
+            90_000,
+            'index-document-core / generateEmbeddings',
+            openaiService.generateEmbeddings(chunks.map((c) => c.content))
+          );
+          console.log(`[ingest] embedding count=${embeddings.length}`);
+
+          if (embeddings.length !== chunks.length) {
+            throw new Error(`Embedding count mismatch: got ${embeddings.length}, expected ${chunks.length}`);
+          }
+
+          // Build and insert rows
+          const rows = chunks.map((chunk, i) => ({
+            document_id: localDocumentId,
+            client_id: clientId,
+            chunk_index: chunk.chunkIndex,
+            content: chunk.content,
+            embedding: embeddings[i],
+            metadata: chunk.metadata,
+          }));
+          await supabaseService.insertKnowledgeChunks(rows);
+          console.log(`[ingest] inserted chunk count=${rows.length}`);
+
+          return {
+            documentId: localDocumentId,
+            contentHash,
+            chunkCount: chunks.length,
+            pageCount,
+            skipped: false,
+            reason: null,
+          };
+
+        } catch (err) {
+          // Write document error before re-throwing so the DB stays consistent
+          // even when Inngest retries exhaust and the outer catch can't see localDocumentId.
+          if (localDocumentId) {
+            await supabaseService.markDocumentError(localDocumentId, err.message).catch((dbErr) => {
+              console.error('[ingest] markDocumentError failed:', dbErr.message);
+            });
+          }
+          throw err;
         }
-        return chunkService.chunkText(parsedText, baseMetadata);
       });
-      console.log(`[ingest] END   chunk-text | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t9}ms | chunkCount=${chunks.length}`);
 
-      if (!chunks.length) throw new Error('Document produced zero chunks');
+      console.log(
+        `[ingest] END   index-document-core | ${tag(jobId, sourceFileId, coreResult.documentId || null)}` +
+        ` | elapsed=${Date.now() - tCore}ms | skipped=${coreResult.skipped}` +
+        (coreResult.skipped ? ` | reason=${coreResult.reason}` : ` | chunkCount=${coreResult.chunkCount} | pageCount=${coreResult.pageCount}`)
+      );
 
-      // -- Step 10: Generate embeddings ----------------------------------------
-      console.log(`[ingest] START generate-embeddings | ${tag(jobId, sourceFileId, documentId)} | chunkCount=${chunks.length}`);
-      const t10 = Date.now();
-      const embeddings = await step.run('generate-embeddings', async () => {
-        return withTimeout(
-          90_000,
-          'generate-embeddings / generateEmbeddings',
-          openaiService.generateEmbeddings(chunks.map((c) => c.content))
-        );
-      });
-      console.log(`[ingest] END   generate-embeddings | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t10}ms | embeddingCount=${embeddings.length}`);
+      // Set documentId now so the outer catch can mark the document as error
+      // if mark-indexed or complete-job fails after the core step succeeds.
+      documentId = coreResult.documentId;
 
-      // -- Step 11: Insert chunks with embeddings into Supabase ----------------
-      console.log(`[ingest] START upsert-chunks | ${tag(jobId, sourceFileId, documentId)} | chunkCount=${chunks.length}`);
-      const t11 = Date.now();
-      await step.run('upsert-chunks', async () => {
-        const rows = chunks.map((chunk, i) => ({
-          document_id: documentId,
-          client_id: clientId,
-          chunk_index: chunk.chunkIndex,
-          content: chunk.content,
-          embedding: embeddings[i],
-          metadata: chunk.metadata,
-        }));
-        await supabaseService.insertKnowledgeChunks(rows);
-      });
-      console.log(`[ingest] END   upsert-chunks | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t11}ms`);
+      // If skipped (unchanged hash or duplicate content), job was already marked completed inside core step
+      if (coreResult.skipped) {
+        return coreResult;
+      }
 
-      // -- Step 12: Mark document indexed --------------------------------------
+      // -- Step 5: Mark document indexed --------------------------------------
       console.log(`[ingest] START mark-indexed | ${tag(jobId, sourceFileId, documentId)}`);
-      const t12 = Date.now();
+      const t5 = Date.now();
       await step.run('mark-indexed', async () => {
         await supabaseService.markDocumentIndexed(documentId);
       });
-      console.log(`[ingest] END   mark-indexed | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t12}ms`);
+      console.log(`[ingest] END   mark-indexed | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t5}ms`);
 
-      // -- Step 13: Complete job -----------------------------------------------
+      // -- Step 6: Complete job -----------------------------------------------
       console.log(`[ingest] START complete-job | ${tag(jobId, sourceFileId, documentId)}`);
-      const t13 = Date.now();
+      const t6 = Date.now();
       await step.run('complete-job', async () => {
         await supabaseService.updateIngestionJob(job.id, { status: 'completed', documentId });
       });
-      console.log(`[ingest] END   complete-job | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t13}ms`);
+      console.log(`[ingest] END   complete-job | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t6}ms`);
 
-      return { success: true, documentId, chunkCount: chunks.length };
+      return { success: true, documentId, chunkCount: coreResult.chunkCount };
+
     } catch (err) {
       console.error(`[ingest] ERROR | ${tag(jobId, sourceFileId, documentId)} | ${err.message}`);
       if (jobId) await supabaseService.logIngestionError(jobId, documentId || null, err);
