@@ -29,6 +29,15 @@ function requireApiKey(req, res, next) {
 
 router.use(requireApiKey);
 
+// Sanitizes error_message field values on job records for production responses.
+// Long messages or messages containing newlines likely contain internal details.
+function sanitizeJobError(msg) {
+  if (!msg) return msg;
+  if (config.server.nodeEnv !== 'production') return msg;
+  if (msg.includes('\n') || msg.length > 300) return 'Ingestion failed. Contact your administrator.';
+  return msg;
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/knowledge/ingest
 // Trigger ingestion of a single document (portal upload only).
@@ -132,6 +141,12 @@ router.delete('/document/:id', async (req, res, next) => {
 
     await supabaseService.requireActiveClient(clientId);
 
+    if (documentId) {
+      const doc = await supabaseService.getKnowledgeDocumentById(documentId);
+      if (!doc) return res.status(404).json({ error: 'Document not found.' });
+      if (doc.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
+    }
+
     const event = await inngest.send({
       name: 'knowledge/document.delete',
       data: { clientId, documentId, sourceFileId, sourceProvider },
@@ -167,7 +182,39 @@ router.get('/jobs/:clientId', async (req, res, next) => {
   try {
     await supabaseService.requireActiveClient(req.params.clientId);
     const jobs = await supabaseService.getIngestionJobsByClient(req.params.clientId);
-    res.json({ jobs });
+    res.json({ jobs: jobs.map((j) => ({ ...j, error_message: sanitizeJobError(j.error_message) })) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/knowledge/summary/:clientId
+// Returns aggregated document, chunk, job, and chat statistics for a client.
+// ---------------------------------------------------------------------------
+
+router.get('/summary/:clientId', async (req, res, next) => {
+  try {
+    const { clientId } = req.params;
+    await supabaseService.requireActiveClient(clientId);
+    const summary = await supabaseService.getClientSummaryData(clientId);
+    res.json(summary);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/knowledge/analytics/:clientId
+// Returns question counts, knowledge gaps, and ingestion activity for a client.
+// ---------------------------------------------------------------------------
+
+router.get('/analytics/:clientId', async (req, res, next) => {
+  try {
+    const { clientId } = req.params;
+    await supabaseService.requireActiveClient(clientId);
+    const analytics = await supabaseService.getClientAnalyticsData(clientId);
+    res.json(analytics);
   } catch (err) {
     next(err);
   }

@@ -22,8 +22,13 @@ app.use('/api/slack', slackRoutes);
 
 app.use((err, _req, res, _next) => {
   const status = err.status || 500;
-  const body = { error: err.message };
-  if (config.server.nodeEnv !== 'production') body.stack = err.stack;
+  const isProd = config.server.nodeEnv === 'production';
+  if (isProd && status >= 500) {
+    console.error('[server error]', err);
+  }
+  const message = (isProd && status >= 500) ? 'An unexpected error occurred.' : err.message;
+  const body = { error: message };
+  if (!isProd) body.stack = err.stack;
   res.status(status).json(body);
 });
 

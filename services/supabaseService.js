@@ -84,7 +84,7 @@ async function logIngestionError(jobId, documentId, err) {
 async function getIngestionJobsByClient(clientId) {
   const { data, error } = await aikbSupabase
     .from('knowledge_ingestion_jobs')
-    .select('*')
+    .select('id, client_id, source_file_id, status, error_message, document_id, created_at, updated_at')
     .eq('client_id', clientId)
     .order('created_at', { ascending: false })
     .limit(100);
@@ -152,6 +152,112 @@ async function getDocumentsByClient(clientId) {
     .order('created_at', { ascending: false });
   if (error) throw new Error(`getDocumentsByClient: ${error.message}`);
   return data;
+}
+
+async function getClientSummaryData(clientId) {
+  const [docsRes, chunksRes, jobsRes, msgsRes, gapsRes] = await Promise.all([
+    aikbSupabase
+      .from('knowledge_documents')
+      .select('status, last_indexed_at')
+      .eq('client_id', clientId),
+    aikbSupabase
+      .from('knowledge_chunks')
+      .select('*', { count: 'exact', head: true })
+      .eq('client_id', clientId),
+    aikbSupabase
+      .from('knowledge_ingestion_jobs')
+      .select('id, source_file_id, status, error_message, document_id, created_at, updated_at')
+      .eq('client_id', clientId)
+      .order('created_at', { ascending: false })
+      .limit(100),
+    aikbSupabase
+      .from('knowledge_chat_messages')
+      .select('created_at')
+      .eq('client_id', clientId)
+      .eq('role', 'user'),
+    aikbSupabase
+      .from('knowledge_gaps')
+      .select('*', { count: 'exact', head: true })
+      .eq('client_id', clientId),
+  ]);
+
+  if (docsRes.error) throw new Error(`getClientSummaryData (docs): ${docsRes.error.message}`);
+  if (chunksRes.error) throw new Error(`getClientSummaryData (chunks): ${chunksRes.error.message}`);
+  if (jobsRes.error) throw new Error(`getClientSummaryData (jobs): ${jobsRes.error.message}`);
+  if (msgsRes.error) throw new Error(`getClientSummaryData (msgs): ${msgsRes.error.message}`);
+  if (gapsRes.error) throw new Error(`getClientSummaryData (gaps): ${gapsRes.error.message}`);
+
+  const docs = docsRes.data;
+  const byStatus = (s) => docs.filter((d) => d.status === s).length;
+  const indexedDates = docs
+    .filter((d) => d.status === 'indexed' && d.last_indexed_at)
+    .map((d) => d.last_indexed_at);
+
+  const jobs = jobsRes.data;
+  const msgs = msgsRes.data;
+  const msgDates = msgs.map((m) => m.created_at);
+
+  return {
+    totalDocuments: docs.length,
+    indexedDocuments: byStatus('indexed'),
+    failedDocuments: byStatus('error'),
+    indexingDocuments: byStatus('indexing') + byStatus('pending'),
+    deletedDocuments: byStatus('deleted'),
+    totalChunks: chunksRes.count ?? 0,
+    latestIngestionJob: jobs[0] ?? null,
+    failedJobsCount: jobs.filter((j) => j.status === 'failed').length,
+    totalQuestions: msgs.length,
+    totalKnowledgeGaps: gapsRes.count ?? 0,
+    lastQuestionAt: msgDates.length ? msgDates.reduce((a, b) => (a > b ? a : b)) : null,
+    lastIndexedAt: indexedDates.length ? indexedDates.reduce((a, b) => (a > b ? a : b)) : null,
+  };
+}
+
+async function getClientAnalyticsData(clientId) {
+  const [msgsRes, gapsRes, recentGapsRes, failedJobsRes, recentJobsRes] = await Promise.all([
+    aikbSupabase
+      .from('knowledge_chat_messages')
+      .select('*', { count: 'exact', head: true })
+      .eq('client_id', clientId)
+      .eq('role', 'user'),
+    aikbSupabase
+      .from('knowledge_gaps')
+      .select('*', { count: 'exact', head: true })
+      .eq('client_id', clientId),
+    aikbSupabase
+      .from('knowledge_gaps')
+      .select('id, question, reason, status, created_at')
+      .eq('client_id', clientId)
+      .order('created_at', { ascending: false })
+      .limit(10),
+    aikbSupabase
+      .from('knowledge_ingestion_jobs')
+      .select('id, source_file_id, status, error_message, created_at, updated_at')
+      .eq('client_id', clientId)
+      .eq('status', 'failed')
+      .order('created_at', { ascending: false })
+      .limit(10),
+    aikbSupabase
+      .from('knowledge_ingestion_jobs')
+      .select('id, source_file_id, status, created_at, updated_at')
+      .eq('client_id', clientId)
+      .order('created_at', { ascending: false })
+      .limit(10),
+  ]);
+
+  if (msgsRes.error) throw new Error(`getClientAnalyticsData (msgs): ${msgsRes.error.message}`);
+  if (gapsRes.error) throw new Error(`getClientAnalyticsData (gaps): ${gapsRes.error.message}`);
+  if (recentGapsRes.error) throw new Error(`getClientAnalyticsData (recent gaps): ${recentGapsRes.error.message}`);
+  if (failedJobsRes.error) throw new Error(`getClientAnalyticsData (failed jobs): ${failedJobsRes.error.message}`);
+  if (recentJobsRes.error) throw new Error(`getClientAnalyticsData (recent jobs): ${recentJobsRes.error.message}`);
+
+  return {
+    totalQuestions: msgsRes.count ?? 0,
+    totalKnowledgeGaps: gapsRes.count ?? 0,
+    recentKnowledgeGaps: recentGapsRes.data ?? [],
+    failedIngestionJobs: failedJobsRes.data ?? [],
+    recentIngestionActivity: recentJobsRes.data ?? [],
+  };
 }
 
 async function getAllIndexedDocumentSourceIds(clientId, provider) {
@@ -482,4 +588,6 @@ module.exports = {
   listChatMessages,
   createKnowledgeGap,
   getIndexedDocumentByContentHash,
+  getClientSummaryData,
+  getClientAnalyticsData,
 };
