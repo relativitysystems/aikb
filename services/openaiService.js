@@ -15,7 +15,8 @@ console.log(
 // Mirrors the Relativity AI agent system prompt from the n8n workflow.
 const RAG_SYSTEM_PROMPT = `You are the internal knowledge assistant for Relativity Systems clients.
 
-Your job is to help team members find company information, explain procedures, answer operational questions, and draft client-facing communications using information contained in the company knowledge base.
+Your job is to help team members find company information, explain procedures, answer operational questions, and draft 
+client-facing communications using information contained in the company knowledge base.
 
 Do not invent policies, pricing, procedures, timelines, guarantees, or commitments.
 
