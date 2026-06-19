@@ -174,7 +174,8 @@ async function getClientSummaryData(clientId) {
       .from('knowledge_chat_messages')
       .select('created_at')
       .eq('client_id', clientId)
-      .eq('role', 'user'),
+      .eq('role', 'user')
+      .is('deleted_at', null),
     aikbSupabase
       .from('knowledge_gaps')
       .select('*', { count: 'exact', head: true })
@@ -198,9 +199,9 @@ async function getClientSummaryData(clientId) {
   const msgDates = msgs.map((m) => m.created_at);
 
   return {
-    totalDocuments: docs.length,
+    totalDocuments: docs.filter((d) => d.status !== 'deleted').length,
     indexedDocuments: byStatus('indexed'),
-    failedDocuments: byStatus('error'),
+    failedDocuments: byStatus('error') + byStatus('failed'),
     indexingDocuments: byStatus('indexing') + byStatus('pending'),
     deletedDocuments: byStatus('deleted'),
     totalChunks: chunksRes.count ?? 0,
@@ -219,7 +220,8 @@ async function getClientAnalyticsData(clientId) {
       .from('knowledge_chat_messages')
       .select('*', { count: 'exact', head: true })
       .eq('client_id', clientId)
-      .eq('role', 'user'),
+      .eq('role', 'user')
+      .is('deleted_at', null),
     aikbSupabase
       .from('knowledge_gaps')
       .select('*', { count: 'exact', head: true })
