@@ -314,14 +314,7 @@ router.post('/query', async (req, res, next) => {
         content: answer,
         sources: [],
       });
-      await supabaseService.createKnowledgeGap({
-        clientId,
-        sessionId,
-        messageId: userMsg.id,
-        question,
-        reason: 'no_chunks_found',
-      });
-      return res.json({ answer, sources: [], sessionId });
+      return res.json({ answer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'no_chunks_found', userMessageId: userMsg.id });
     }
 
     // 3. Generate answer
@@ -365,14 +358,7 @@ router.post('/query', async (req, res, next) => {
         sources: [],
         metadata: chunkMetadata,
       });
-      await supabaseService.createKnowledgeGap({
-        clientId,
-        sessionId,
-        messageId: userMsg.id,
-        question,
-        reason: 'answer_indicated_not_found',
-      });
-      return res.json({ answer: normalizedAnswer, sources: [], sessionId });
+      return res.json({ answer: normalizedAnswer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'answer_indicated_not_found', userMessageId: userMsg.id });
     }
 
     // 5. Save the assistant message with real sources and chunk metadata
@@ -385,7 +371,7 @@ router.post('/query', async (req, res, next) => {
       metadata: chunkMetadata,
     });
 
-    res.json({ answer, sources, sessionId });
+    res.json({ answer, sources, sessionId, isKnowledgeGap: false });
   } catch (err) {
     next(err);
   }
@@ -483,6 +469,34 @@ router.patch('/chat/sessions/:clientId/:sessionId/title', async (req, res, next)
     }
     const updated = await supabaseService.updateChatSessionTitle(clientId, sessionId, title);
     res.json({ session: updated });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/knowledge/gaps
+// Explicit save of a knowledge gap — called by the portal when the user
+// chooses to save. The query endpoint no longer writes gaps automatically.
+// Body: { clientId, sessionId, question, reason, messageId? }
+// Returns: { success: true, gap }
+// ---------------------------------------------------------------------------
+
+router.post('/gaps', async (req, res, next) => {
+  try {
+    const { clientId, sessionId, question, reason, messageId } = req.body;
+    if (!clientId || !sessionId || !question || !reason) {
+      return res.status(400).json({ error: 'clientId, sessionId, question, and reason are required' });
+    }
+    await supabaseService.requireActiveClient(clientId);
+    const gap = await supabaseService.createKnowledgeGap({
+      clientId,
+      sessionId,
+      messageId: messageId || null,
+      question,
+      reason,
+    });
+    res.json({ success: true, gap });
   } catch (err) {
     next(err);
   }
