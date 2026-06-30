@@ -5,8 +5,14 @@ const { inngest } = require('../inngest/client');
 const supabaseService = require('../services/supabaseService');
 const openaiService = require('../services/openaiService');
 const config = require('../config');
+const { requireMemberContext } = require('../middleware/resolveContext');
 
 const router = express.Router();
+
+// Returns true for roles that can see/manage all sessions under a client.
+function isAdminRole(role) {
+  return role === 'owner' || role === 'admin';
+}
 
 // ---------------------------------------------------------------------------
 // API key middleware
@@ -257,7 +263,7 @@ function normalizeGapAnswerSource(answer) {
 // Returns: { answer, sources, sessionId }
 // ---------------------------------------------------------------------------
 
-router.post('/query', async (req, res, next) => {
+router.post('/query', requireMemberContext, async (req, res, next) => {
   try {
     const { clientId, question, sessionId: providedSessionId, sessionMessages = [] } = req.body;
     if (!clientId || !question) {
@@ -266,17 +272,20 @@ router.post('/query', async (req, res, next) => {
 
     await supabaseService.requireActiveClient(clientId);
 
+    const { memberId, memberRole } = req.context;
+    const isAdmin = isAdminRole(memberRole);
+
     // Resolve or create the chat session
     let sessionId;
     if (providedSessionId) {
-      const session = await supabaseService.getChatSession(clientId, providedSessionId);
+      const session = await supabaseService.getChatSession(clientId, providedSessionId, memberId, isAdmin);
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
       sessionId = session.id;
     } else {
       const title = question.trim().slice(0, 50);
-      const session = await supabaseService.createChatSession(clientId, title);
+      const session = await supabaseService.createChatSession(clientId, title, memberId);
       sessionId = session.id;
     }
 
@@ -286,6 +295,7 @@ router.post('/query', async (req, res, next) => {
       sessionId,
       role: 'user',
       content: question,
+      memberId,
     });
 
     // Classify intent before running retrieval to avoid vector search on greetings,
@@ -301,6 +311,7 @@ router.post('/query', async (req, res, next) => {
         content: answer,
         sources: [],
         metadata: { intent, retrievalSkipped: true },
+        memberId,
       });
       return res.json({
         answer,
@@ -339,6 +350,7 @@ router.post('/query', async (req, res, next) => {
         content: answer,
         sources: [],
         metadata: { intent, retrievalSkipped: false },
+        memberId,
       });
       return res.json({ answer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'no_chunks_found', userMessageId: userMsg.id, intent });
     }
@@ -383,6 +395,7 @@ router.post('/query', async (req, res, next) => {
         content: normalizedAnswer,
         sources: [],
         metadata: { ...chunkMetadata, intent, retrievalSkipped: false },
+        memberId,
       });
       return res.json({ answer: normalizedAnswer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'answer_indicated_not_found', userMessageId: userMsg.id, intent });
     }
@@ -395,6 +408,7 @@ router.post('/query', async (req, res, next) => {
       content: answer,
       sources,
       metadata: { ...chunkMetadata, intent, retrievalSkipped: false },
+      memberId,
     });
 
     res.json({ answer, sources, sessionId, isKnowledgeGap: false, userMessageId: userMsg.id, intent });
@@ -408,11 +422,13 @@ router.post('/query', async (req, res, next) => {
 // List all non-deleted sessions for a client (newest first).
 // ---------------------------------------------------------------------------
 
-router.get('/chat/sessions/:clientId', async (req, res, next) => {
+router.get('/chat/sessions/:clientId', requireMemberContext, async (req, res, next) => {
   try {
     const { clientId } = req.params;
     await supabaseService.requireActiveClient(clientId);
-    const sessions = await supabaseService.listChatSessions(clientId);
+    const { memberId, memberRole } = req.context;
+    const isAdmin = isAdminRole(memberRole);
+    const sessions = await supabaseService.listChatSessions(clientId, memberId, isAdmin);
     res.json({ sessions });
   } catch (err) {
     next(err);
@@ -424,11 +440,13 @@ router.get('/chat/sessions/:clientId', async (req, res, next) => {
 // Return all non-deleted messages for a session, ordered oldest-first.
 // ---------------------------------------------------------------------------
 
-router.get('/chat/sessions/:clientId/:sessionId/messages', async (req, res, next) => {
+router.get('/chat/sessions/:clientId/:sessionId/messages', requireMemberContext, async (req, res, next) => {
   try {
     const { clientId, sessionId } = req.params;
     await supabaseService.requireActiveClient(clientId);
-    const session = await supabaseService.getChatSession(clientId, sessionId);
+    const { memberId, memberRole } = req.context;
+    const isAdmin = isAdminRole(memberRole);
+    const session = await supabaseService.getChatSession(clientId, sessionId, memberId, isAdmin);
     if (!session) {
       return res.status(404).json({ error: 'Session not found' });
     }
@@ -444,15 +462,17 @@ router.get('/chat/sessions/:clientId/:sessionId/messages', async (req, res, next
 // Soft-delete a single session and all its messages.
 // ---------------------------------------------------------------------------
 
-router.delete('/chat/sessions/:clientId/:sessionId', async (req, res, next) => {
+router.delete('/chat/sessions/:clientId/:sessionId', requireMemberContext, async (req, res, next) => {
   try {
     const { clientId, sessionId } = req.params;
     await supabaseService.requireActiveClient(clientId);
-    const session = await supabaseService.getChatSession(clientId, sessionId);
+    const { memberId, memberRole } = req.context;
+    const isAdmin = isAdminRole(memberRole);
+    const session = await supabaseService.getChatSession(clientId, sessionId, memberId, isAdmin);
     if (!session) {
       return res.status(404).json({ error: 'Session not found' });
     }
-    await supabaseService.softDeleteChatSession(clientId, sessionId);
+    await supabaseService.softDeleteChatSession(clientId, sessionId, memberId, isAdmin);
     res.json({ success: true });
   } catch (err) {
     next(err);
@@ -464,11 +484,13 @@ router.delete('/chat/sessions/:clientId/:sessionId', async (req, res, next) => {
 // Soft-delete all sessions and messages for a client.
 // ---------------------------------------------------------------------------
 
-router.delete('/chat/history/:clientId', async (req, res, next) => {
+router.delete('/chat/history/:clientId', requireMemberContext, async (req, res, next) => {
   try {
     const { clientId } = req.params;
     await supabaseService.requireActiveClient(clientId);
-    await supabaseService.softDeleteAllChatHistory(clientId);
+    const { memberId, memberRole } = req.context;
+    const isAdmin = isAdminRole(memberRole);
+    await supabaseService.softDeleteAllChatHistory(clientId, memberId, isAdmin);
     res.json({ success: true });
   } catch (err) {
     next(err);
@@ -481,7 +503,7 @@ router.delete('/chat/history/:clientId', async (req, res, next) => {
 // Body: { title }
 // ---------------------------------------------------------------------------
 
-router.patch('/chat/sessions/:clientId/:sessionId/title', async (req, res, next) => {
+router.patch('/chat/sessions/:clientId/:sessionId/title', requireMemberContext, async (req, res, next) => {
   try {
     const { clientId, sessionId } = req.params;
     const { title } = req.body;
@@ -489,11 +511,13 @@ router.patch('/chat/sessions/:clientId/:sessionId/title', async (req, res, next)
       return res.status(400).json({ error: 'title is required' });
     }
     await supabaseService.requireActiveClient(clientId);
-    const session = await supabaseService.getChatSession(clientId, sessionId);
+    const { memberId, memberRole } = req.context;
+    const isAdmin = isAdminRole(memberRole);
+    const session = await supabaseService.getChatSession(clientId, sessionId, memberId, isAdmin);
     if (!session) {
       return res.status(404).json({ error: 'Session not found' });
     }
-    const updated = await supabaseService.updateChatSessionTitle(clientId, sessionId, title);
+    const updated = await supabaseService.updateChatSessionTitle(clientId, sessionId, title, memberId, isAdmin);
     res.json({ session: updated });
   } catch (err) {
     next(err);
@@ -508,19 +532,21 @@ router.patch('/chat/sessions/:clientId/:sessionId/title', async (req, res, next)
 // Returns: { success: true, gap }
 // ---------------------------------------------------------------------------
 
-router.post('/gaps', async (req, res, next) => {
+router.post('/gaps', requireMemberContext, async (req, res, next) => {
   try {
     const { clientId, sessionId, question, reason, messageId } = req.body;
     if (!clientId || !sessionId || !question || !reason) {
       return res.status(400).json({ error: 'clientId, sessionId, question, and reason are required' });
     }
     await supabaseService.requireActiveClient(clientId);
+    const { memberId } = req.context;
     const gap = await supabaseService.createKnowledgeGap({
       clientId,
       sessionId,
       messageId: messageId || null,
       question,
       reason,
+      memberId,
     });
     res.json({ success: true, gap });
   } catch (err) {

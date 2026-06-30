@@ -364,8 +364,34 @@ async function insertKnowledgeChunks(chunks) {
 }
 
 // ---------------------------------------------------------------------------
-// Global client validation (Relativity_Global project)
+// Global client validation + member resolution (Relativity_Global project)
 // ---------------------------------------------------------------------------
+
+// Validates a Supabase JWT issued by Relativity_Global's auth service.
+// Returns the auth user object ({ id, email, ... }) or null if invalid.
+async function validateAuthToken(token) {
+  const { data: { user }, error } = await globalSupabase.auth.getUser(token);
+  if (error || !user) return null;
+  return user;
+}
+
+// Looks up a client_members row by (client_id, user_id).
+// member_id (row.id) is stored in AIKB as a plain UUID — no FK because
+// cross-project foreign keys are not supported in Supabase.
+// Returns { id, role } or null if the user is not a member of this client.
+async function getMemberByAuthUser(clientId, authUserId) {
+  const { data, error } = await globalSupabase
+    .from('client_members')
+    .select('id, role')
+    .eq('client_id', clientId)
+    .eq('auth_user_id', authUserId) // auth_user_id = Supabase auth.users.id in Relativity_Global
+    .maybeSingle();
+  if (error) {
+    console.warn(`getMemberByAuthUser: ${error.message}`);
+    return null;
+  }
+  return data;
+}
 
 async function getGlobalClientById(clientId) {
   const { data, error } = await globalSupabase
@@ -410,61 +436,97 @@ async function searchChunks(clientId, queryEmbedding, { threshold = 0.15, count 
 // Chat sessions
 // ---------------------------------------------------------------------------
 
-async function createChatSession(clientId, title) {
+// member_id references Relativity_Global.client_members.id — stored as a plain UUID
+// because cross-project foreign keys are not supported in Supabase.
+async function createChatSession(clientId, title, memberId = null) {
   const { data, error } = await aikbSupabase
     .from('knowledge_chat_sessions')
-    .insert({ client_id: clientId, title })
+    .insert({ client_id: clientId, title, member_id: memberId })
     .select()
     .single();
   if (error) throw new Error(`createChatSession: ${error.message}`);
   return data;
 }
 
-async function getChatSession(clientId, sessionId) {
-  const { data, error } = await aikbSupabase
+// memberId + isAdmin control visibility:
+//   - memberId set, not admin → only that member's session
+//   - memberId null (no auth) or isAdmin → any session for the client (backward compat / admin)
+async function getChatSession(clientId, sessionId, memberId = null, isAdmin = false) {
+  let query = aikbSupabase
     .from('knowledge_chat_sessions')
     .select('*')
     .eq('id', sessionId)
     .eq('client_id', clientId)
-    .is('deleted_at', null)
-    .maybeSingle();
+    .is('deleted_at', null);
+
+  if (memberId && !isAdmin) {
+    query = query.eq('member_id', memberId);
+  }
+
+  const { data, error } = await query.maybeSingle();
   if (error) throw new Error(`getChatSession: ${error.message}`);
-  return data; // null if not found or belongs to a different client
+  return data; // null if not found, wrong client, or wrong member
 }
 
-async function listChatSessions(clientId) {
-  const { data, error } = await aikbSupabase
+// memberId set, not admin → only that member's sessions (existing null-member_id rows hidden).
+// memberId null (no auth) or isAdmin → all non-deleted sessions for the client.
+async function listChatSessions(clientId, memberId = null, isAdmin = false) {
+  let query = aikbSupabase
     .from('knowledge_chat_sessions')
-    .select('id, title, created_at, updated_at')
+    .select('id, title, created_at, updated_at, member_id')
     .eq('client_id', clientId)
     .is('deleted_at', null)
     .order('created_at', { ascending: false });
+
+  if (memberId && !isAdmin) {
+    query = query.eq('member_id', memberId);
+  }
+
+  const { data, error } = await query;
   if (error) throw new Error(`listChatSessions: ${error.message}`);
   return data;
 }
 
-async function updateChatSessionTitle(clientId, sessionId, title) {
-  const { data, error } = await aikbSupabase
+// memberId set, not admin → scope the UPDATE to prevent a member from renaming another's session.
+// (getChatSession ownership check runs before this in the route, so this is defense in depth.)
+async function updateChatSessionTitle(clientId, sessionId, title, memberId = null, isAdmin = false) {
+  let query = aikbSupabase
     .from('knowledge_chat_sessions')
     .update({ title, updated_at: new Date().toISOString() })
     .eq('id', sessionId)
     .eq('client_id', clientId)
-    .is('deleted_at', null)
-    .select()
-    .single();
+    .is('deleted_at', null);
+
+  if (memberId && !isAdmin) {
+    query = query.eq('member_id', memberId);
+  }
+
+  const { data, error } = await query.select().single();
   if (error) throw new Error(`updateChatSessionTitle: ${error.message}`);
   return data;
 }
 
-async function softDeleteChatSession(clientId, sessionId) {
+// memberId set, not admin → scope delete to that member's session (defense in depth;
+// getChatSession ownership check should have already run before this).
+// memberId null or isAdmin → delete by client + session only.
+async function softDeleteChatSession(clientId, sessionId, memberId = null, isAdmin = false) {
   const now = new Date().toISOString();
-  const { error: sessionError } = await aikbSupabase
+
+  let sessionQuery = aikbSupabase
     .from('knowledge_chat_sessions')
     .update({ deleted_at: now, updated_at: now })
     .eq('id', sessionId)
     .eq('client_id', clientId);
+
+  if (memberId && !isAdmin) {
+    sessionQuery = sessionQuery.eq('member_id', memberId);
+  }
+
+  const { error: sessionError } = await sessionQuery;
   if (sessionError) throw new Error(`softDeleteChatSession: ${sessionError.message}`);
 
+  // Messages are always scoped by session_id + client_id.
+  // Ownership of the session was already validated above.
   const { error: msgError } = await aikbSupabase
     .from('knowledge_chat_messages')
     .update({ deleted_at: now })
@@ -473,20 +535,35 @@ async function softDeleteChatSession(clientId, sessionId) {
   if (msgError) throw new Error(`softDeleteChatSession (messages): ${msgError.message}`);
 }
 
-async function softDeleteAllChatHistory(clientId) {
+// memberId set, not admin → only soft-delete sessions (and messages) owned by that member.
+// memberId null (no auth) or isAdmin → soft-delete all history for the client.
+async function softDeleteAllChatHistory(clientId, memberId = null, isAdmin = false) {
   const now = new Date().toISOString();
-  const { error: sessionError } = await aikbSupabase
+
+  let sessionQuery = aikbSupabase
     .from('knowledge_chat_sessions')
     .update({ deleted_at: now, updated_at: now })
     .eq('client_id', clientId)
     .is('deleted_at', null);
+
+  if (memberId && !isAdmin) {
+    sessionQuery = sessionQuery.eq('member_id', memberId);
+  }
+
+  const { error: sessionError } = await sessionQuery;
   if (sessionError) throw new Error(`softDeleteAllChatHistory (sessions): ${sessionError.message}`);
 
-  const { error: msgError } = await aikbSupabase
+  let msgQuery = aikbSupabase
     .from('knowledge_chat_messages')
     .update({ deleted_at: now })
     .eq('client_id', clientId)
     .is('deleted_at', null);
+
+  if (memberId && !isAdmin) {
+    msgQuery = msgQuery.eq('member_id', memberId);
+  }
+
+  const { error: msgError } = await msgQuery;
   if (msgError) throw new Error(`softDeleteAllChatHistory (messages): ${msgError.message}`);
 }
 
@@ -494,10 +571,12 @@ async function softDeleteAllChatHistory(clientId) {
 // Chat messages
 // ---------------------------------------------------------------------------
 
-async function createChatMessage({ clientId, sessionId, role, content, sources = null, metadata = null }) {
+// member_id is denormalised here (same as client_id) for fast member-scoped queries
+// without joining knowledge_chat_sessions. References Relativity_Global.client_members.id.
+async function createChatMessage({ clientId, sessionId, role, content, sources = null, metadata = null, memberId = null }) {
   const { data, error } = await aikbSupabase
     .from('knowledge_chat_messages')
-    .insert({ client_id: clientId, session_id: sessionId, role, content, sources, metadata })
+    .insert({ client_id: clientId, session_id: sessionId, role, content, sources, metadata, member_id: memberId })
     .select()
     .single();
   if (error) throw new Error(`createChatMessage: ${error.message}`);
@@ -548,10 +627,11 @@ async function getIndexedDocumentByContentHash(clientId, provider, contentHash, 
 // Knowledge gaps
 // ---------------------------------------------------------------------------
 
-async function createKnowledgeGap({ clientId, sessionId, messageId, question, reason }) {
+// member_id references Relativity_Global.client_members.id — plain UUID, no FK.
+async function createKnowledgeGap({ clientId, sessionId, messageId, question, reason, memberId = null }) {
   const { data, error } = await aikbSupabase
     .from('knowledge_gaps')
-    .insert({ client_id: clientId, session_id: sessionId, message_id: messageId, question, reason })
+    .insert({ client_id: clientId, session_id: sessionId, message_id: messageId, question, reason, member_id: memberId })
     .select()
     .single();
   if (error) throw new Error(`createKnowledgeGap: ${error.message}`);
@@ -580,6 +660,8 @@ module.exports = {
   searchChunks,
   getGlobalClientById,
   requireActiveClient,
+  validateAuthToken,
+  getMemberByAuthUser,
   createChatSession,
   getChatSession,
   listChatSessions,
