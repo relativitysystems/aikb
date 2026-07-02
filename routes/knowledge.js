@@ -165,6 +165,30 @@ router.delete('/document/:id', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// DELETE /api/knowledge/client/:clientId
+// Internal cleanup: hard-deletes ALL AIKB data for a client (storage objects,
+// documents, chunks, chat history, gaps, ingestion jobs). Called by
+// Relativity's client-deletion flow BEFORE the Global client row is removed.
+// Deliberately does NOT call requireActiveClient — this endpoint must work
+// even after the Global client record is gone. Protection is inherited from
+// the router-level requireApiKey gate above (line 36), same as every other
+// route in this file — do not add requireActiveClient here.
+// ---------------------------------------------------------------------------
+
+router.delete('/client/:clientId', async (req, res, next) => {
+  try {
+    const { clientId } = req.params;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clientId)) {
+      return res.status(400).json({ error: 'clientId must be a valid UUID' });
+    }
+    const summary = await supabaseService.deleteAllClientData(clientId);
+    res.json({ success: summary.errors.length === 0, clientId, ...summary });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // GET /api/knowledge/documents/:clientId
 // List all indexed documents for a client.
 // ---------------------------------------------------------------------------

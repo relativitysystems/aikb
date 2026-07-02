@@ -638,6 +638,108 @@ async function createKnowledgeGap({ clientId, sessionId, messageId, question, re
   return data;
 }
 
+// ---------------------------------------------------------------------------
+// Client-wide hard delete (cleanup)
+// Called by the internal /client/:clientId cleanup route AFTER the Global
+// clients row may already be gone — must never depend on requireActiveClient
+// or any Global DB lookup succeeding. Every step below is independent and
+// non-fatal so reruns on a partially-cleaned client are safe.
+// ---------------------------------------------------------------------------
+
+async function deleteStorageForClient(clientId) {
+  const bucket = config.storage.bucket;
+  const prefix = `uploads/${clientId}`;
+  const limit = 1000;
+  let offset = 0;
+  const names = [];
+  while (true) {
+    const { data, error } = await aikbSupabase.storage.from(bucket).list(prefix, { limit, offset });
+    if (error) {
+      console.warn(`[deleteStorageForClient] list failed for ${prefix}: ${error.message}`);
+      return { removed: 0, errors: [error.message] };
+    }
+    if (!data || data.length === 0) break;
+    names.push(...data.map((f) => f.name));
+    if (data.length < limit) break;
+    offset += limit;
+  }
+  if (names.length === 0) return { removed: 0, errors: [] };
+
+  const paths = names.map((n) => `${prefix}/${n}`);
+  const errors = [];
+  let removed = 0;
+  for (let i = 0; i < paths.length; i += 1000) {
+    const batch = paths.slice(i, i + 1000);
+    const { data, error } = await aikbSupabase.storage.from(bucket).remove(batch);
+    if (error) {
+      console.warn(`[deleteStorageForClient] remove batch failed: ${error.message}`);
+      errors.push(error.message);
+    } else {
+      removed += (data || batch).length;
+    }
+  }
+  return { removed, errors };
+}
+
+// Best-effort: no migration in this repo defines a bare `documents` table
+// (only `knowledge_documents`), but a legacy table may still exist live in
+// the DB from before this repo's history. Must never throw — swallow
+// "table/column doesn't exist" errors so cleanup keeps going regardless.
+async function deleteLegacyDocumentsForClient(clientId) {
+  try {
+    const { error, count } = await aikbSupabase
+      .from('documents')
+      .delete({ count: 'exact' })
+      .or(`metadata->>clientId.eq.${clientId},metadata->>client_id.eq.${clientId}`);
+    if (error) {
+      console.warn(`[deleteLegacyDocumentsForClient] ${error.message}`);
+      return { attempted: true, deleted: 0, error: error.message };
+    }
+    return { attempted: true, deleted: count ?? 0 };
+  } catch (err) {
+    console.warn(`[deleteLegacyDocumentsForClient] ${err.message}`);
+    return { attempted: true, deleted: 0, error: err.message };
+  }
+}
+
+async function deleteAllClientData(clientId) {
+  console.log(`[deleteAllClientData] START | clientId=${clientId}`);
+  const errors = [];
+
+  const storage = await deleteStorageForClient(clientId);
+  errors.push(...storage.errors.map((e) => `storage: ${e}`));
+  console.log(`[deleteAllClientData] storage removed=${storage.removed} errors=${storage.errors.length}`);
+
+  // Children before parents — defensive given the live schema may drift
+  // from this repo's tracked migrations; don't rely solely on cascade.
+  const tables = [
+    'knowledge_gaps',
+    'knowledge_chat_messages',
+    'knowledge_chat_sessions',
+    'knowledge_chunks',
+    'knowledge_ingestion_jobs',
+    'knowledge_documents',
+  ];
+  const tableResults = {};
+  for (const table of tables) {
+    const { error, count } = await aikbSupabase.from(table).delete({ count: 'exact' }).eq('client_id', clientId);
+    if (error) {
+      console.error(`[deleteAllClientData] ${table} delete failed: ${error.message}`);
+      errors.push(`${table}: ${error.message}`);
+      tableResults[table] = { error: error.message };
+    } else {
+      console.log(`[deleteAllClientData] ${table} deleted count=${count ?? 'n/a'}`);
+      tableResults[table] = { deleted: count ?? null };
+    }
+  }
+
+  const legacyDocuments = await deleteLegacyDocumentsForClient(clientId);
+  if (legacyDocuments.error) errors.push(`legacyDocuments: ${legacyDocuments.error}`);
+
+  console.log(`[deleteAllClientData] DONE | clientId=${clientId} | errors=${errors.length}`);
+  return { storage, tables: tableResults, legacyDocuments, errors };
+}
+
 module.exports = {
   downloadFromStorage,
   deleteFromStorage,
@@ -674,4 +776,5 @@ module.exports = {
   getIndexedDocumentByContentHash,
   getClientSummaryData,
   getClientAnalyticsData,
+  deleteAllClientData,
 };
