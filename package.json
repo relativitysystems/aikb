@@ -13,7 +13,7 @@
     "express": "^4",
     "googleapis": "^140",
     "inngest": "^3",
-    "openai": "^4",
+    "openai": "^6.45.0",
     "pdf-parse": "^1"
   },
   "devDependencies": {
