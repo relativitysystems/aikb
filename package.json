@@ -13,6 +13,7 @@
     "express": "^4",
     "googleapis": "^140",
     "inngest": "^3",
+    "mammoth": "^1.12.0",
     "openai": "^6.45.0",
     "pdf-parse": "^1"
   },

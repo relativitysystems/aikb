@@ -11,6 +11,24 @@ class UnsupportedMimeTypeError extends Error {
 // Maximum time to wait for a single pdfParse() call before giving up.
 const PDF_PARSE_TIMEOUT_MS = 60_000;
 
+const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+// Some upload paths (browser file pickers, generic storage clients) hand back a
+// generic content-type instead of the real DOCX MIME type. When that happens,
+// fall back to the file extension so local uploads and Google Drive imports —
+// which both flow through the same portal_upload ingest event — resolve to the
+// same parser branch.
+const GENERIC_MIME_TYPES = new Set(['application/octet-stream', 'application/zip', '']);
+
+/**
+ * Extract plain text from a DOCX buffer via mammoth.
+ */
+async function parseDocx(buffer) {
+  const mammoth = require('mammoth');
+  const result = await mammoth.extractRawText({ buffer });
+  return { text: cleanText(result.value || ''), pages: [] };
+}
+
 /**
  * Wraps a pdfParse() call with a hard timeout so that a hanging
  * getTextContent() inside pdf.js cannot freeze the Inngest step indefinitely.
@@ -35,6 +53,7 @@ function parsePdf(buffer, opts) {
  * Supported MIME types:
  *   text/plain, text/markdown, text/csv  — decoded as UTF-8
  *   application/pdf                      — extracted via pdf-parse
+ *   .docx (openxmlformats wordprocessingml) — extracted via mammoth
  *   application/vnd.google-apps.*        — should never reach here;
  *                                          googleDriveService exports Google Docs as text/plain
  *
@@ -50,10 +69,19 @@ async function parseDocument(buffer, mimeType, fileName) {
     throw new TypeError('parseDocument: buffer must be a Buffer');
   }
 
-  const type = (mimeType || '').toLowerCase().split(';')[0].trim();
+  let type = (mimeType || '').toLowerCase().split(';')[0].trim();
+
+  // Normalize generic/missing MIME types to DOCX when the file extension says so.
+  if (GENERIC_MIME_TYPES.has(type) && /\.docx$/i.test(fileName || '')) {
+    type = DOCX_MIME;
+  }
 
   if (type === 'text/plain' || type === 'text/markdown' || type === 'text/csv' || type === '') {
     return cleanText(buffer.toString('utf8'));
+  }
+
+  if (type === DOCX_MIME) {
+    return parseDocx(buffer);
   }
 
   if (type === 'application/pdf') {

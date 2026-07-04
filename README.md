@@ -234,7 +234,7 @@ POST /api/knowledge/ingest
   2. Check for existing document (dedup)
   3. Mark job running
   4. Download file from Supabase Storage
-  5. Parse text (PDF, plain text, CSV, Markdown)
+  5. Parse text (PDF, DOCX, plain text, CSV, Markdown)
   6. Compute SHA-256 content hash
   7. Content hash dedup (skips if unchanged)
   8. Upsert document record
