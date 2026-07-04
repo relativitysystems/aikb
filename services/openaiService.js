@@ -12,10 +12,12 @@ console.log(
 );
 
 // System prompt used for all RAG query completions.
-const RAG_SYSTEM_PROMPT = `You are the internal knowledge assistant for Relativity Systems clients.
+const RAG_SYSTEM_PROMPT = `You are the knowledge assistant for Relativity Systems clients.
 
-Your job is to help team members find company information, explain procedures, answer operational questions, and draft 
-client-facing communications using information contained in the company knowledge base.
+Your job is to answer questions using the content of the client's uploaded documents, whatever those
+documents are — company policies and SOPs, but equally technical manuals, PDFs, DOCX files, reports,
+research notes, or any other uploaded material (including non-business content like stories or poems).
+Answer directly from what the document says; explain, summarize, or interpret its content as asked.
 
 Do not invent policies, pricing, procedures, timelines, guarantees, or commitments.
 
@@ -169,14 +171,26 @@ async function generateChatCompletion(messages, systemPrompt) {
 // Intent classification
 // ---------------------------------------------------------------------------
 
-const INTENT_CLASSIFIER_PROMPT = `You are an intent classifier for an internal knowledge base assistant used by business teams.
+const INTENT_CLASSIFIER_PROMPT = `You are an intent classifier for a knowledge base assistant. The knowledge base is a
+generic document store: each client uploads whatever documents matter to them — company
+SOPs and policies, yes, but just as often technical manuals, PDFs, DOCX files, contracts,
+research notes, school assignments, poems, stories, articles, or any other text content.
+You do not know in advance what a given client has uploaded, so never assume the knowledge
+base is limited to business/SOP/policy material.
 
 Classify the user message into exactly one of these intents and return strict JSON only.
 
 ## Intents
 
-"knowledge_query" — User is asking for information that should come from uploaded company documents: SOPs, policies, FAQs, training materials, pricing guides, scripts, handbooks, or internal processes.
-Examples: "What is our refund policy?", "How do we reschedule last-minute appointments?", "Do we offer partial refunds on group bookings?", "What are the onboarding steps?"
+"knowledge_query" — User is asking a question that could plausibly be answered by looking
+inside an uploaded document, whatever its subject matter. This includes business questions
+(policies, SOPs, FAQs, pricing) AND content questions about any other uploaded material —
+asking what happens in a story or poem, what a passage means, summarizing a named document,
+explaining a technical concept, etc. When in doubt about whether a topic could be covered by
+an uploaded document, prefer "knowledge_query" over "unsupported".
+Examples: "What is our refund policy?", "How do we reschedule last-minute appointments?",
+"What happens in the poem?", "What does he mean by that line?", "Summarize the collaborative
+response document", "Explain chapter 2", "What are the onboarding steps?"
 shouldRunRetrieval: true, shouldAllowKnowledgeGap: true
 
 "casual_conversation" — Greeting, small talk, thanks, acknowledgement, or non-task social phrase.
@@ -191,8 +205,14 @@ shouldRunRetrieval: false, shouldAllowKnowledgeGap: false
 Examples: "refund", "policy", "pricing?", "what about onboarding?", "the process"
 shouldRunRetrieval: false, shouldAllowKnowledgeGap: false
 
-"unsupported" — Request is outside knowledge base scope: personal trivia, jokes, general internet knowledge, weather, medical/legal advice unrelated to company docs, etc.
-Examples: "what's my favorite ice cream?", "write me a poem", "who won the Super Bowl?", "what's the weather?"
+"unsupported" — Request clearly cannot be answered by any document a client could upload:
+requests to generate brand-new creative content from scratch, general internet trivia,
+current events, live weather, or personal opinions about the assistant itself. This is NOT
+about the topic being "business-related" — a question about a poem, story, or technical
+subject is still "knowledge_query" if it's asking about content that could be in an uploaded
+document. Reserve "unsupported" for things no document lookup could ever answer.
+Examples: "what's my favorite ice cream?", "write me a brand new poem about spring",
+"who won the Super Bowl last night?", "what's the weather right now?"
 shouldRunRetrieval: false, shouldAllowKnowledgeGap: false
 
 ## Rules
@@ -200,6 +220,7 @@ shouldRunRetrieval: false, shouldAllowKnowledgeGap: false
 - Never classify an unsupported question as a knowledge gap.
 - Only allow knowledge gap when intent is "knowledge_query" and retrieval fails.
 - If confidence is low (< 0.7), prefer "clarification_needed" unless the message clearly asks for company/internal documentation.
+- Do not classify a question as "unsupported" merely because it isn't about business policies, SOPs, or procedures — the knowledge base can contain any kind of document.
 
 ## Output format (strict JSON, no markdown, no extra keys)
 {
@@ -321,10 +342,10 @@ function buildConversationalResponse(question) {
     'Hello! How can I assist you today?',
     '',
     'Guidance',
-    'Your message appears to be a greeting. I can help answer questions using your approved knowledge base documents.',
+    'Your message appears to be a greeting. I can help answer questions using your uploaded documents.',
     '',
     'Next Step',
-    'Ask me about a policy, SOP, FAQ, pricing document, training guide, or internal process.',
+    'Ask me about anything covered in your uploaded documents — a policy, SOP, FAQ, pricing sheet, training guide, or any other document content.',
     '',
     'Source',
     'Source: N/A',
@@ -334,13 +355,13 @@ function buildConversationalResponse(question) {
 function buildHelpResponse() {
   return [
     'TL;DR',
-    "I'm your internal knowledge assistant. I can help you find answers from your company's uploaded documents.",
+    "I'm your knowledge assistant. I can help you find answers from your uploaded documents.",
     '',
     'Guidance',
-    'You can ask me about policies, SOPs, FAQs, pricing guides, training materials, onboarding steps, or any internal process documented in your knowledge base.',
+    'You can ask me about anything contained in your uploaded documents — policies, SOPs, FAQs, pricing guides, training materials, technical docs, or any other document content.',
     '',
     'Next Step',
-    'Try asking something like: "What is our refund policy?" or "How do we handle last-minute appointment reschedules?"',
+    'Try asking something like: "What is our refund policy?" or "Summarize the [document name] document."',
     '',
     'Source',
     'Source: N/A',
@@ -369,10 +390,10 @@ function buildUnsupportedResponse(question) {
     "That question is outside the scope of the knowledge base.",
     '',
     'Guidance',
-    "I'm designed to answer questions about your company's internal documents, policies, SOPs, FAQs, and operational procedures. I can't help with general knowledge, personal questions, or topics unrelated to your uploaded documents.",
+    "I'm designed to answer questions using the content of your uploaded documents, whatever they contain — policies, manuals, reports, or anything else. I can't help with general knowledge, personal questions, or topics unrelated to your uploaded documents.",
     '',
     'Next Step',
-    'Ask me about a company policy, internal process, or topic covered in your uploaded knowledge base.',
+    'Ask me about a topic or document that has actually been uploaded to your knowledge base.',
     '',
     'Source',
     'Source: N/A',

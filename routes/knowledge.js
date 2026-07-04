@@ -323,10 +323,30 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
     });
 
     // Classify intent before running retrieval to avoid vector search on greetings,
-    // small talk, help requests, and vague/unsupported messages.
+    // small talk, and help requests — these can never be answered from documents.
     const intent = await openaiService.classifyQueryIntent(question);
 
-    if (!intent.shouldRunRetrieval) {
+    // The classifier has no visibility into what a client has actually uploaded — a
+    // knowledge base can contain poems, technical docs, school papers, etc., not just
+    // business SOPs. So a classifier verdict of "unsupported" is not trusted outright:
+    // if the client has indexed documents, retrieval still runs, and we only fall back
+    // to the unsupported response if retrieval genuinely finds nothing relevant.
+    let runRetrieval = intent.shouldRunRetrieval;
+    if (!runRetrieval && intent.intent === 'unsupported') {
+      runRetrieval = await supabaseService.hasIndexedDocuments(clientId);
+    }
+
+    console.log('[query] intent classification', {
+      question,
+      clientId,
+      intent: intent.intent,
+      confidence: intent.confidence,
+      classifierShouldRunRetrieval: intent.shouldRunRetrieval,
+      retrievalSkipped: !runRetrieval,
+      reason: intent.reason,
+    });
+
+    if (!runRetrieval) {
       const answer = openaiService.buildNonRetrievalAnswer(question, intent);
       await supabaseService.createChatMessage({
         clientId,
@@ -351,15 +371,25 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
     // 1. Embed the question
     const queryEmbedding = await openaiService.embedQuery(question);
 
-    // 2. Retrieve relevant chunks scoped to this client
-    const chunks = await supabaseService.searchChunks(clientId, queryEmbedding, {
-      threshold: 0.15,
-      count: 10,
-    });
+    // 2. Retrieve relevant chunks scoped to this client. If the question references
+    // a document by title/filename (e.g. "the collaborative response document"),
+    // that document's chunks are guaranteed to be included and ranked first.
+    const { chunks, matchedDocumentIds } = await supabaseService.searchChunksWithTitleBoost(
+      clientId, queryEmbedding, question, { threshold: 0.15, count: 10 }
+    );
 
     console.log('[query] retrieval summary', {
       question,
+      intent: intent.intent,
+      retrievalSkipped: false,
+      titleMatchedDocumentIds: matchedDocumentIds,
       chunkCount: chunks.length,
+      retrievedChunks: chunks.map((c) => ({
+        documentId: c.document_id,
+        fileName: c.metadata?.fileName ?? null,
+        similarity: c.similarity,
+        titleMatched: !!c.titleMatched,
+      })),
       topScore: chunks[0]?.similarity ?? null,
       topSource: chunks[0]?.metadata?.fileName ?? null,
       topPage: chunks[0]?.metadata?.pageNumber ?? null,

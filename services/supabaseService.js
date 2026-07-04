@@ -432,6 +432,90 @@ async function searchChunks(clientId, queryEmbedding, { threshold = 0.15, count 
   return data;
 }
 
+// Cheap existence check used to decide whether an "unsupported"-classified query
+// still deserves a retrieval attempt (see routes/knowledge.js /query).
+async function hasIndexedDocuments(clientId) {
+  const { count, error } = await aikbSupabase
+    .from('knowledge_documents')
+    .select('id', { count: 'exact', head: true })
+    .eq('client_id', clientId)
+    .eq('status', 'indexed');
+  if (error) throw new Error(`hasIndexedDocuments: ${error.message}`);
+  return (count ?? 0) > 0;
+}
+
+function normalizeTitle(name) {
+  return (name || '')
+    .replace(/\.[a-z0-9]+$/i, '')     // strip file extension
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/[^a-z0-9 ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Finds documents whose file name/title is referenced in the question, e.g.
+ * "summarize the collaborative response document" -> Collaborative response.docx.
+ * Returns matching document ids.
+ */
+function matchDocumentsByTitle(question, documents) {
+  const q = (question || '').toLowerCase();
+  const matched = [];
+  for (const doc of documents || []) {
+    const norm = normalizeTitle(doc.file_name);
+    if (!norm) continue;
+    if (q.includes(norm)) {
+      matched.push(doc.id);
+      continue;
+    }
+    const words = norm.split(' ').filter((w) => w.length > 2);
+    if (words.length >= 2 && words.filter((w) => q.includes(w)).length / words.length >= 0.6) {
+      matched.push(doc.id);
+    }
+  }
+  return matched;
+}
+
+/**
+ * Vector search with filename/title-aware boosting: if the question references
+ * an indexed document by name, that document's chunks are guaranteed to be
+ * included (and ranked first) even if their cosine similarity falls under the
+ * default threshold or outside the top-N vector matches.
+ */
+async function searchChunksWithTitleBoost(clientId, queryEmbedding, question, { threshold = 0.15, count = 10 } = {}) {
+  const vectorMatches = await searchChunks(clientId, queryEmbedding, { threshold, count });
+
+  const documents = await getDocumentsByClient(clientId);
+  const matchedDocumentIds = matchDocumentsByTitle(question, documents);
+
+  if (!matchedDocumentIds.length) {
+    return { chunks: vectorMatches, matchedDocumentIds: [] };
+  }
+
+  const { data: titleChunks, error } = await aikbSupabase
+    .from('knowledge_chunks')
+    .select('id, document_id, content, metadata')
+    .in('document_id', matchedDocumentIds)
+    .order('chunk_index', { ascending: true })
+    .limit(count);
+  if (error) throw new Error(`searchChunksWithTitleBoost: ${error.message}`);
+
+  const seen = new Set();
+  const chunks = [];
+  for (const c of titleChunks || []) {
+    seen.add(c.id);
+    chunks.push({ ...c, similarity: 1, titleMatched: true });
+  }
+  for (const c of vectorMatches) {
+    if (seen.has(c.id)) continue;
+    seen.add(c.id);
+    chunks.push(c);
+  }
+
+  return { chunks: chunks.slice(0, count), matchedDocumentIds };
+}
+
 // ---------------------------------------------------------------------------
 // Chat sessions
 // ---------------------------------------------------------------------------
@@ -760,6 +844,9 @@ module.exports = {
   deleteChunksForDocument,
   insertKnowledgeChunks,
   searchChunks,
+  hasIndexedDocuments,
+  matchDocumentsByTitle,
+  searchChunksWithTitleBoost,
   getGlobalClientById,
   requireActiveClient,
   validateAuthToken,
