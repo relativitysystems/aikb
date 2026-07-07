@@ -193,15 +193,25 @@ Classify the user message into exactly one of these intents and return strict JS
 
 ## Intents
 
-"knowledge_query" — User is asking a question that could plausibly be answered by looking
-inside an uploaded document, whatever its subject matter. This includes business questions
-(policies, SOPs, FAQs, pricing) AND content questions about any other uploaded material —
-asking what happens in a story or poem, what a passage means, summarizing a named document,
-explaining a technical concept, etc. When in doubt about whether a topic could be covered by
-an uploaded document, prefer "knowledge_query" over "unsupported".
+"knowledge_query" — The default classification for any complete sentence, question, or statement
+that could plausibly be answered by looking inside an uploaded document, whatever its subject
+matter. This includes business questions (policies, SOPs, FAQs, pricing) AND content questions
+about any other uploaded material — asking what happens in a story or poem, what a passage means,
+summarizing a named document, explaining a technical concept, etc. When in doubt about whether a
+topic could be covered by an uploaded document, prefer "knowledge_query" over "unsupported" or
+"clarification_needed". Do not require the message to name a specific file or document.
+- Questions beginning with "what is", "what are", "how does", "how do", "explain", "summarize",
+  "tell me about", "list", or "describe" should usually be "knowledge_query".
+- Mentions of SOP, policy, architecture, layers, workflow, process, checklist, pricing, onboarding,
+  training, FAQ, document, guide, manual, or system should usually be "knowledge_query".
+- A statement — not just a question — that sounds like the user is referencing something that may
+  be documented (e.g. "I think there are 5 layers") is still "knowledge_query", not clarification.
+- Do not mark a full sentence or question as "clarification_needed" just because it doesn't name a
+  specific file.
 Examples: "What is our refund policy?", "How do we reschedule last-minute appointments?",
 "What happens in the poem?", "What does he mean by that line?", "Summarize the collaborative
-response document", "Explain chapter 2", "What are the onboarding steps?"
+response document", "Explain chapter 2", "What are the onboarding steps?", "What are the SOP's?",
+"What is the knowledge base architecture?", "I think there are 5 layers"
 shouldRunRetrieval: true, shouldAllowKnowledgeGap: true
 
 "casual_conversation" — Greeting, small talk, thanks, acknowledgement, or non-task social phrase.
@@ -212,8 +222,13 @@ shouldRunRetrieval: false, shouldAllowKnowledgeGap: false
 Examples: "what can you do?", "how does this work?", "what should I ask?", "help"
 shouldRunRetrieval: false, shouldAllowKnowledgeGap: false
 
-"clarification_needed" — Message is too vague or incomplete to search reliably, but may become a knowledge query if clarified.
-Examples: "refund", "policy", "pricing?", "what about onboarding?", "the process"
+"clarification_needed" — Reserved for short fragments that are too incomplete to search reliably —
+not full sentences, questions, or statements. Use this only when the message is a bare word or
+phrase with no verb and no clear subject, such as "refund", "pricing?", "policy", "that one", or
+"what about it" — unless recent session context makes the reference clear (see below). A complete
+question or statement should almost never be "clarification_needed", even if it is short — prefer
+"knowledge_query" instead.
+Examples: "refund", "policy", "pricing?", "that one", "what about it"
 shouldRunRetrieval: false, shouldAllowKnowledgeGap: false
 
 "unsupported" — Request clearly cannot be answered by any document a client could upload:
@@ -246,8 +261,11 @@ topic, or answer already established earlier in the same session — never as a 
 - Never classify a short greeting as a knowledge gap.
 - Never classify an unsupported question as a knowledge gap.
 - Only allow knowledge gap when intent is "knowledge_query" and retrieval fails.
-- If confidence is low (< 0.7) and conversation context does not clearly anchor the message to a prior
-  topic, prefer "clarification_needed" unless the message clearly asks for company/internal documentation.
+- Default to "knowledge_query" for any complete sentence, question, or statement that could
+  plausibly relate to uploaded content, even if it doesn't name a specific document, policy, or
+  file, and even if your confidence is moderate rather than high.
+- Reserve "clarification_needed" for bare fragments with no verb and no clear subject (see examples
+  above) — not for full sentences or questions that are merely short.
 - Do not classify a question as "unsupported" merely because it isn't about business policies, SOPs, or procedures — the knowledge base can contain any kind of document.
 
 ## Output format (strict JSON, no markdown, no extra keys)
@@ -271,8 +289,15 @@ const GREETING_WORDS = new Set([
 // Clearly vague single-word prompts — let LLM clarify rather than searching.
 const VAGUE_SINGLE_WORDS = new Set([
   'refund', 'pricing', 'policy', 'onboarding',
-  'process', 'procedure', 'info', 'information',
+  'process', 'procedure', 'info', 'information', 'first',
 ]);
+
+// Question phrases that signal a real question rather than a bare fragment.
+const QUESTION_PHRASE_PATTERN = /\b(what|how|why|when|where|who|explain|summarize|list|describe|tell me)\b/i;
+
+// Domain/document keywords that signal the message likely refers to uploaded content.
+// Matched against a copy of the message with apostrophes stripped, so "SOP's" -> "SOPs" matches "sops?".
+const DOMAIN_KEYWORD_PATTERN = /\b(sops?|polic(?:y|ies)|architecture|layers?|workflow|process|checklist|pricing|onboarding|training|faq|document|guide|manual|system|knowledge base)\b/i;
 
 // Formats recent session messages into a compact "Role: content" transcript for
 // inclusion in LLM prompts. Each message is truncated to keep the prompt small.
@@ -331,6 +356,26 @@ async function classifyQueryIntent(question, sessionMessages = []) {
       shouldAllowKnowledgeGap: false,
       responseStyle: 'clarify',
       reason: 'Vague single-word term detected by guardrail',
+    };
+  }
+
+  // Guardrail: document-style question or statement — 3+ words containing either a question
+  // phrase or a domain/document keyword almost always warrants retrieval. This exists because
+  // the LLM classifier alone was over-flagging real questions (e.g. "what are the sop's",
+  // "what is the knowledge base architecture") as clarification_needed.
+  const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
+  const normalizedForKeywords = lower.replace(/['']/g, '');
+  if (
+    wordCount >= 3 &&
+    (QUESTION_PHRASE_PATTERN.test(lower) || DOMAIN_KEYWORD_PATTERN.test(normalizedForKeywords))
+  ) {
+    return {
+      intent: 'knowledge_query',
+      confidence: 0.9,
+      shouldRunRetrieval: true,
+      shouldAllowKnowledgeGap: true,
+      responseStyle: 'rag',
+      reason: 'Document-style question detected by guardrail',
     };
   }
 
