@@ -283,13 +283,16 @@ function normalizeGapAnswerSource(answer) {
 // ---------------------------------------------------------------------------
 // POST /api/knowledge/query
 // Synchronous RAG query: vector search + LLM answer.
-// Body: { clientId, question, sessionId?, sessionMessages? }
+// Body: { clientId, question, sessionId? }
+// Recent session context is loaded server-side (see listRecentChatMessages)
+// rather than trusted from the request body, so follow-up questions can be
+// classified/retrieved using the actual prior conversation.
 // Returns: { answer, sources, sessionId }
 // ---------------------------------------------------------------------------
 
 router.post('/query', requireMemberContext, async (req, res, next) => {
   try {
-    const { clientId, question, sessionId: providedSessionId, sessionMessages = [] } = req.body;
+    const { clientId, question, sessionId: providedSessionId } = req.body;
     if (!clientId || !question) {
       return res.status(400).json({ error: 'clientId and question are required' });
     }
@@ -322,9 +325,20 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
       memberId,
     });
 
+    // Load recent session history server-side (not trusted from the request body) so
+    // follow-up questions can be classified/retrieved using the actual prior conversation.
+    // Excludes the message just saved above and any deleted messages; capped to a small
+    // window so prompts stay small.
+    const recentMessages = await supabaseService.listRecentChatMessages(clientId, sessionId, 8);
+    const recentSessionMessages = recentMessages
+      .filter((m) => m.id !== userMsg.id)
+      .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
+
     // Classify intent before running retrieval to avoid vector search on greetings,
     // small talk, and help requests — these can never be answered from documents.
-    const intent = await openaiService.classifyQueryIntent(question);
+    // Recent session messages let the classifier recognize follow-ups (e.g. "what should
+    // I do first") that reference a document/topic already established in this session.
+    const intent = await openaiService.classifyQueryIntent(question, recentSessionMessages);
 
     // The classifier has no visibility into what a client has actually uploaded — a
     // knowledge base can contain poems, technical docs, school papers, etc., not just
@@ -339,6 +353,7 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
     console.log('[query] intent classification', {
       question,
       clientId,
+      sessionContextMessages: recentSessionMessages.length,
       intent: intent.intent,
       confidence: intent.confidence,
       classifierShouldRunRetrieval: intent.shouldRunRetrieval,
@@ -354,7 +369,7 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
         role: 'assistant',
         content: answer,
         sources: [],
-        metadata: { intent, retrievalSkipped: true },
+        metadata: { question, retrievalQuery: null, intent, retrievalSkipped: true },
         memberId,
       });
       return res.json({
@@ -368,18 +383,24 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
       });
     }
 
-    // 1. Embed the question
-    const queryEmbedding = await openaiService.embedQuery(question);
+    // Rewrite the retrieval query using session context so follow-ups (e.g. "what about
+    // the checklist") search using the topic/document established earlier in the session.
+    // The original user question is still what gets answered — only retrieval uses this.
+    const retrievalQuery = await openaiService.buildRetrievalQuery(question, recentSessionMessages);
 
-    // 2. Retrieve relevant chunks scoped to this client. If the question references
+    // 1. Embed the (possibly rewritten) retrieval query
+    const queryEmbedding = await openaiService.embedQuery(retrievalQuery);
+
+    // 2. Retrieve relevant chunks scoped to this client. If the retrieval query references
     // a document by title/filename (e.g. "the collaborative response document"),
     // that document's chunks are guaranteed to be included and ranked first.
     const { chunks, matchedDocumentIds } = await supabaseService.searchChunksWithTitleBoost(
-      clientId, queryEmbedding, question, { threshold: 0.15, count: 10 }
+      clientId, queryEmbedding, retrievalQuery, { threshold: 0.15, count: 10 }
     );
 
     console.log('[query] retrieval summary', {
       question,
+      retrievalQuery,
       intent: intent.intent,
       retrievalSkipped: false,
       titleMatchedDocumentIds: matchedDocumentIds,
@@ -403,14 +424,15 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
         role: 'assistant',
         content: answer,
         sources: [],
-        metadata: { intent, retrievalSkipped: false },
+        metadata: { question, retrievalQuery, intent, retrievalSkipped: false },
         memberId,
       });
       return res.json({ answer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'no_chunks_found', userMessageId: userMsg.id, intent });
     }
 
-    // 3. Generate answer
-    const answer = await openaiService.generateRagAnswer(question, chunks, sessionMessages);
+    // 3. Generate answer — always answers the original question, using session
+    // messages only to understand context, and chunks as the sole source of facts.
+    const answer = await openaiService.generateRagAnswer(question, chunks, recentSessionMessages);
 
     // 4. Build sources list (deduplicated by documentId, with page numbers when available)
     const sourceMap = new Map();
@@ -433,6 +455,8 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
     });
 
     const chunkMetadata = {
+      question,
+      retrievalQuery,
       chunkCount: chunks.length,
       documentIds: [...new Set(chunks.map((c) => c.document_id))],
     };

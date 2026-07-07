@@ -688,6 +688,22 @@ async function listChatMessages(clientId, sessionId) {
   return data;
 }
 
+// Fetches the most recent `limit` non-deleted messages for a session, returned
+// oldest-first. Used to give the intent classifier/retrieval query builder
+// short-term conversation context without loading full session history.
+async function listRecentChatMessages(clientId, sessionId, limit = 8) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_chat_messages')
+    .select('id, role, content, created_at')
+    .eq('client_id', clientId)
+    .eq('session_id', sessionId)
+    .is('deleted_at', null)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) throw new Error(`listRecentChatMessages: ${error.message}`);
+  return (data || []).reverse();
+}
+
 // ---------------------------------------------------------------------------
 // Duplicate content detection
 // ---------------------------------------------------------------------------
@@ -859,6 +875,7 @@ module.exports = {
   softDeleteAllChatHistory,
   createChatMessage,
   listChatMessages,
+  listRecentChatMessages,
   createKnowledgeGap,
   getIndexedDocumentByContentHash,
   getClientSummaryData,

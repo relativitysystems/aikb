@@ -32,6 +32,17 @@ When information is missing, incomplete, outdated, or conflicting, clearly state
 - If the question is not documented, missing, or cannot be answered from the retrieved context, do NOT cite a retrieved document as if it supports the answer. Use: Source: N/A
 - If documents disagree, present both versions and recommend confirmation with the appropriate owner.
 
+## Style
+
+- Summarize and synthesize what the retrieved context says in your own words — do not dump long
+  verbatim sections or reproduce the document structure unless the user explicitly asks to see the
+  full text, a quote, or the exact wording.
+- Prefer concise bullets and action-oriented phrasing over dense paragraphs, especially for
+  checklists, steps, or routines.
+- If recent conversation messages are included before the context, use them only to understand what
+  the user is referring to (e.g. "it", "that", "first", "today") — never as a source of facts. All
+  factual claims must still come from the retrieved context below.
+
 ## Response Format
 
 TL;DR
@@ -215,11 +226,28 @@ Examples: "what's my favorite ice cream?", "write me a brand new poem about spri
 "who won the Super Bowl last night?", "what's the weather right now?"
 shouldRunRetrieval: false, shouldAllowKnowledgeGap: false
 
+## Using recent conversation context
+You may be given a short excerpt of recent conversation history right before the latest message.
+Use it only to decide whether the latest message is a follow-up that refers back to a document,
+topic, or answer already established earlier in the same session — never as a source of facts.
+
+- If the recent conversation shows a document, SOP, checklist, policy, or other retrieved content was
+  already being discussed, and the latest message is a short follow-up that leans on that context —
+  using words/phrases like "this", "that", "it", "first", "today", "checklist", "routine", "next", or
+  "what should I do" — classify it as "knowledge_query", not "clarification_needed". The prior context
+  is what makes the reference concrete, even though the message alone looks vague.
+- Only apply this when the recent conversation actually establishes a document/topic. If the prior
+  messages are casual conversation, a greeting, or there is no conversation context at all, judge the
+  latest message strictly on its own — a bare, ambiguous message with nothing to anchor it is still
+  "clarification_needed".
+- Never use conversation context to answer the question yourself. You are only classifying intent.
+
 ## Rules
 - Never classify a short greeting as a knowledge gap.
 - Never classify an unsupported question as a knowledge gap.
 - Only allow knowledge gap when intent is "knowledge_query" and retrieval fails.
-- If confidence is low (< 0.7), prefer "clarification_needed" unless the message clearly asks for company/internal documentation.
+- If confidence is low (< 0.7) and conversation context does not clearly anchor the message to a prior
+  topic, prefer "clarification_needed" unless the message clearly asks for company/internal documentation.
 - Do not classify a question as "unsupported" merely because it isn't about business policies, SOPs, or procedures — the knowledge base can contain any kind of document.
 
 ## Output format (strict JSON, no markdown, no extra keys)
@@ -246,14 +274,26 @@ const VAGUE_SINGLE_WORDS = new Set([
   'process', 'procedure', 'info', 'information',
 ]);
 
+// Formats recent session messages into a compact "Role: content" transcript for
+// inclusion in LLM prompts. Each message is truncated to keep the prompt small.
+function formatSessionContext(sessionMessages) {
+  if (!sessionMessages || !sessionMessages.length) return '';
+  return sessionMessages
+    .map((m) => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${(m.content || '').slice(0, 500)}`)
+    .join('\n');
+}
+
 /**
  * Classify the user's question to decide whether to run vector retrieval.
+ * sessionMessages (optional): recent { role, content } messages from the current
+ * chat session, oldest-first, used only to disambiguate follow-up questions —
+ * never as a source of facts.
  * Returns:
  *   { intent, confidence, shouldRunRetrieval, shouldAllowKnowledgeGap, responseStyle, reason }
  *
  * Classifier failure always falls back to clarification_needed (never retrieval).
  */
-async function classifyQueryIntent(question) {
+async function classifyQueryIntent(question, sessionMessages = []) {
   const trimmed = (question || '').trim();
 
   // Guardrail: empty input
@@ -296,11 +336,16 @@ async function classifyQueryIntent(question) {
 
   // LLM classifier for everything else
   try {
+    const contextBlock = formatSessionContext(sessionMessages);
+    const userContent = contextBlock
+      ? `Recent conversation (oldest first):\n${contextBlock}\n\nLatest message to classify: "${trimmed}"`
+      : trimmed;
+
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
         { role: 'system', content: INTENT_CLASSIFIER_PROMPT },
-        { role: 'user', content: trimmed },
+        { role: 'user', content: userContent },
       ],
       temperature: 0,
       response_format: { type: 'json_object' },
@@ -329,6 +374,60 @@ async function classifyQueryIntent(question) {
       responseStyle: 'clarify',
       reason: 'Classifier fallback due to error',
     };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Retrieval query rewriting
+// ---------------------------------------------------------------------------
+
+const RETRIEVAL_QUERY_REWRITE_PROMPT = `You rewrite a user's latest chat message into a concise, keyword-rich
+search query for a document vector search / title-matching system. You are given recent conversation
+history and the latest user message.
+
+Rules:
+- If the latest message stands on its own (no ambiguous references, no missing topic), return it
+  unchanged, only lightly cleaned up — do not rewrite it.
+- If the latest message is a follow-up that depends on the recent conversation (e.g. it uses words
+  like "this", "that", "it", "first", "today", "checklist", "routine", "next"), combine the topic or
+  document established in the recent conversation with what the latest message is specifically asking
+  about into a short keyword phrase.
+- Only use topics/documents that are actually present in the recent conversation. Never invent a
+  document name or topic that was not mentioned or clearly implied.
+- Output ONLY the rewritten search query text — no quotes, no explanation, no markdown, no punctuation
+  beyond what's natural in a search phrase.
+- Keep it concise: a short phrase of relevant keywords, not a full sentence.
+- Never answer the question. You are only producing a search query.`;
+
+/**
+ * Builds a concise search query for retrieval by combining the latest question
+ * with relevant recent session context (e.g. a document/topic established
+ * earlier in the conversation). Falls back to the original question if there
+ * is no session context or if the rewrite call fails.
+ */
+async function buildRetrievalQuery(question, sessionMessages = []) {
+  const trimmed = (question || '').trim();
+  if (!trimmed || !sessionMessages.length) return trimmed;
+
+  try {
+    const contextBlock = formatSessionContext(sessionMessages);
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: RETRIEVAL_QUERY_REWRITE_PROMPT },
+        {
+          role: 'user',
+          content: `Recent conversation (oldest first):\n${contextBlock}\n\nLatest user message: "${trimmed}"`,
+        },
+      ],
+      temperature: 0,
+    });
+
+    const rewritten = response.choices[0].message.content?.trim();
+    return rewritten || trimmed;
+  } catch (err) {
+    console.error('[buildRetrievalQuery] rewrite error, falling back to original question:', err.message);
+    return trimmed;
   }
 }
 
@@ -371,13 +470,13 @@ function buildHelpResponse() {
 function buildClarificationResponse(question) {
   return [
     'TL;DR',
-    'I need a little more detail before searching the knowledge base.',
+    'I need a little more detail before I can search the uploaded documents.',
     '',
     'Guidance',
-    `"${question}" is a bit vague. Could you clarify what aspect you'd like to know about? For example, are you asking about eligibility, the process, how to communicate it to a customer, or something else?`,
+    `"${question}" is a bit vague on its own. Which document, policy, checklist, process, or topic should I look in?`,
     '',
     'Next Step',
-    'Please ask a complete question, such as "What is our refund policy?" or "How do we handle appointment cancellations?"',
+    'Try: "Summarize the onboarding SOP" or "What does the pricing document say about renewals?"',
     '',
     'Source',
     'Source: N/A',
@@ -419,5 +518,6 @@ module.exports = {
   generateChatCompletion,
   RAG_SYSTEM_PROMPT,
   classifyQueryIntent,
+  buildRetrievalQuery,
   buildNonRetrievalAnswer,
 };
