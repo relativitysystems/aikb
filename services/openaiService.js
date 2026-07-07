@@ -182,32 +182,30 @@ async function generateChatCompletion(messages, systemPrompt) {
 // Intent classification
 // ---------------------------------------------------------------------------
 
-const INTENT_CLASSIFIER_PROMPT = `You are an intent classifier for a knowledge base assistant. The knowledge base is a
-generic document store: each client uploads whatever documents matter to them — company
-SOPs and policies, yes, but just as often technical manuals, PDFs, DOCX files, contracts,
-research notes, school assignments, poems, stories, articles, or any other text content.
-You do not know in advance what a given client has uploaded, so never assume the knowledge
-base is limited to business/SOP/policy material.
+const INTENT_CLASSIFIER_PROMPT = `You are an intent classifier for a knowledge base assistant. This product is a
+document-grounded knowledge base, not a general-purpose AI assistant — its only job is to answer
+questions from each client's uploaded documents. The knowledge base is a generic document store:
+each client uploads whatever documents matter to them — company SOPs and policies, yes, but just as
+often technical manuals, PDFs, DOCX files, contracts, research notes, school assignments, poems,
+stories, articles, or any other text content. You do not know in advance what a given client has
+uploaded, so never assume the knowledge base is limited to business/SOP/policy material.
 
-Classify the user message into exactly one of these intents and return strict JSON only.
+Classify the user message into exactly one of these intents and return strict JSON only. Judge
+based on whether the message reads like a real question or statement, not by matching it against a
+fixed list of trigger words — this is a judgment call, not a keyword lookup.
 
 ## Intents
 
-"knowledge_query" — The default classification for any complete sentence, question, or statement
-that could plausibly be answered by looking inside an uploaded document, whatever its subject
-matter. This includes business questions (policies, SOPs, FAQs, pricing) AND content questions
-about any other uploaded material — asking what happens in a story or poem, what a passage means,
-summarizing a named document, explaining a technical concept, etc. When in doubt about whether a
-topic could be covered by an uploaded document, prefer "knowledge_query" over "unsupported" or
-"clarification_needed". Do not require the message to name a specific file or document.
-- Questions beginning with "what is", "what are", "how does", "how do", "explain", "summarize",
-  "tell me about", "list", or "describe" should usually be "knowledge_query".
-- Mentions of SOP, policy, architecture, layers, workflow, process, checklist, pricing, onboarding,
-  training, FAQ, document, guide, manual, or system should usually be "knowledge_query".
-- A statement — not just a question — that sounds like the user is referencing something that may
-  be documented (e.g. "I think there are 5 layers") is still "knowledge_query", not clarification.
-- Do not mark a full sentence or question as "clarification_needed" just because it doesn't name a
-  specific file.
+"knowledge_query" — The default classification for any complete user question or statement that
+could plausibly be answered by looking inside an uploaded document, whatever its subject matter.
+This includes business questions (policies, SOPs, FAQs, pricing) AND content questions about any
+other uploaded material — asking what happens in a story or poem, what a passage means, summarizing
+a named document, explaining a technical concept, etc. It also includes statements (not just
+questions) that sound like the user is referencing or checking something that may be documented.
+When in doubt about whether a topic could be covered by an uploaded document, prefer
+"knowledge_query" over "unsupported" or "clarification_needed". Do not require the message to name
+a specific file, and do not mark a full sentence or question as "clarification_needed" just because
+it's short or doesn't name a specific document.
 Examples: "What is our refund policy?", "How do we reschedule last-minute appointments?",
 "What happens in the poem?", "What does he mean by that line?", "Summarize the collaborative
 response document", "Explain chapter 2", "What are the onboarding steps?", "What are the SOP's?",
@@ -292,13 +290,6 @@ const VAGUE_SINGLE_WORDS = new Set([
   'process', 'procedure', 'info', 'information', 'first',
 ]);
 
-// Question phrases that signal a real question rather than a bare fragment.
-const QUESTION_PHRASE_PATTERN = /\b(what|how|why|when|where|who|explain|summarize|list|describe|tell me)\b/i;
-
-// Domain/document keywords that signal the message likely refers to uploaded content.
-// Matched against a copy of the message with apostrophes stripped, so "SOP's" -> "SOPs" matches "sops?".
-const DOMAIN_KEYWORD_PATTERN = /\b(sops?|polic(?:y|ies)|architecture|layers?|workflow|process|checklist|pricing|onboarding|training|faq|document|guide|manual|system|knowledge base)\b/i;
-
 // Formats recent session messages into a compact "Role: content" transcript for
 // inclusion in LLM prompts. Each message is truncated to keep the prompt small.
 function formatSessionContext(sessionMessages) {
@@ -359,27 +350,9 @@ async function classifyQueryIntent(question, sessionMessages = []) {
     };
   }
 
-  // Guardrail: document-style question or statement — 3+ words containing either a question
-  // phrase or a domain/document keyword almost always warrants retrieval. This exists because
-  // the LLM classifier alone was over-flagging real questions (e.g. "what are the sop's",
-  // "what is the knowledge base architecture") as clarification_needed.
-  const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
-  const normalizedForKeywords = lower.replace(/['']/g, '');
-  if (
-    wordCount >= 3 &&
-    (QUESTION_PHRASE_PATTERN.test(lower) || DOMAIN_KEYWORD_PATTERN.test(normalizedForKeywords))
-  ) {
-    return {
-      intent: 'knowledge_query',
-      confidence: 0.9,
-      shouldRunRetrieval: true,
-      shouldAllowKnowledgeGap: true,
-      responseStyle: 'rag',
-      reason: 'Document-style question detected by guardrail',
-    };
-  }
-
-  // LLM classifier for everything else
+  // Everything else — including document-style questions like "what are the sop's" or
+  // "what is the knowledge base architecture" — goes to the LLM classifier. No hard-coded
+  // keyword/phrase lists: the prompt instructs it to default to "knowledge_query".
   try {
     const contextBlock = formatSessionContext(sessionMessages);
     const userContent = contextBlock
