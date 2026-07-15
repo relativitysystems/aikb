@@ -3,13 +3,15 @@
 const express = require('express');
 const crypto = require('crypto');
 const config = require('../config');
-const supabaseService = require('../services/supabaseService');
-const openaiService = require('../services/openaiService');
 
 const router = express.Router();
 
 // ---------------------------------------------------------------------------
 // Slack request signature verification middleware
+//
+// Kept fully intact — signature verification and replay-window protection
+// remain required even though this endpoint is retired below. An unsigned
+// or forged request must never reach the retirement response.
 // ---------------------------------------------------------------------------
 
 function verifySlackSignature(req, res, next) {
@@ -50,112 +52,59 @@ function verifySlackSignature(req, res, next) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/slack/events
-// Receives Slack Events API payloads.
-// Handles: url_verification challenge + app_mention events.
+// Logging helpers
+//
+// Only enough to notice that a real Slack app is still pointed at this
+// retired endpoint. Never logs message text, questions, tokens, secrets,
+// or the raw request body.
 // ---------------------------------------------------------------------------
 
-router.post('/events', verifySlackSignature, async (req, res) => {
-  const { type, challenge, event } = req.body;
+function hashTeamId(teamId) {
+  if (!teamId) return null;
+  return crypto.createHash('sha256').update(String(teamId)).digest('hex').slice(0, 12);
+}
 
-  // Slack URL verification handshake
+function logRetiredEventCallback(req) {
+  const body = req.body || {};
+  const eventType = (body.event && body.event.type) || body.type || 'unknown';
+  const requestId = req.headers['x-request-id'] || body.event_id || null;
+
+  console.warn('[slack] retired endpoint received an event — no processing performed', {
+    eventType,
+    teamIdHash: hashTeamId(body.team_id),
+    requestId,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/slack/events
+//
+// RETIRED. This provider-specific handler previously derived a fake tenant
+// from a hash of the Slack channel ID and posted replies using a single
+// static global bot token — both unsafe (Architecture Review Phase 1 §6/§9,
+// Phase 4 Milestone 1). The safe replacement lives in Relativity's Slack
+// Surface. Until that ships, this route stays mounted (so Slack's app
+// config doesn't 404 unexpectedly) but performs no document retrieval, no
+// answer generation, no client/organization derivation, and no Slack
+// posting for any event.
+//
+// url_verification is still answered normally — it carries no tenant data
+// and Slack uses it purely to confirm the endpoint is reachable — but only
+// after signature verification succeeds, same as before.
+// ---------------------------------------------------------------------------
+
+router.post('/events', verifySlackSignature, (req, res) => {
+  const { type, challenge } = req.body || {};
+
   if (type === 'url_verification') {
     return res.json({ challenge });
   }
 
-  // Acknowledge immediately — Slack requires a 200 within 3 seconds
-  res.status(200).send();
+  logRetiredEventCallback(req);
 
-  if (type !== 'event_callback' || !event) return;
-  if (event.type !== 'app_mention') return;
-
-  // Skip messages from bots (prevents infinite loops)
-  if (event.bot_id || event.subtype === 'bot_message') return;
-
-  const channel = event.channel;
-  const thread_ts = event.thread_ts || event.ts;
-
-  // Strip <@BOT_ID> mention from the text
-  const question = (event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim();
-  if (!question) return;
-
-  // Derive clientId from channel (simple mapping: one Slack channel = one client).
-  // In production this would be a DB lookup; for MVP use the channel ID as a stable client key.
-  // Wrap in a UUID v5-style hash so it fits the UUID column format.
-  const clientId = slackChannelToClientId(channel);
-
-  try {
-    // 1. Embed the question
-    const queryEmbedding = await openaiService.embedQuery(question);
-
-    // 2. Retrieve relevant chunks
-    const chunks = await supabaseService.searchChunks(clientId, queryEmbedding, {
-      threshold: 0.65,
-      count: 5,
-    });
-
-    let answer;
-    if (!chunks.length) {
-      answer = "I couldn't find any relevant information in the knowledge base for your question. Try rephrasing or check that the relevant documents have been indexed.";
-    } else {
-      answer = await openaiService.generateRagAnswer(question, chunks);
-    }
-
-    await postSlackMessage(channel, thread_ts, answer);
-  } catch (err) {
-    console.error('[slack/events] error processing app_mention:', err.message);
-    await postSlackMessage(
-      channel,
-      thread_ts,
-      'Sorry, I ran into an error processing your question. Please try again.'
-    ).catch(() => {}); // best-effort
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Map a Slack channel ID to a deterministic UUID for client_id lookups.
- * This is the MVP approach. Replace with a real DB lookup when clients are
- * onboarded through the portal.
- */
-function slackChannelToClientId(channelId) {
-  // Use a UUID v5-like hash: namespace + channel ID → fixed UUID
-  const namespace = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'; // UUID v5 DNS namespace
-  const hash = crypto
-    .createHash('sha1')
-    .update(namespace + channelId)
-    .digest('hex');
-  // Format as UUID
-  return [
-    hash.slice(0, 8),
-    hash.slice(8, 12),
-    '5' + hash.slice(13, 16),
-    ((parseInt(hash[16], 16) & 0x3) | 0x8).toString(16) + hash.slice(17, 20),
-    hash.slice(20, 32),
-  ].join('-');
-}
-
-async function postSlackMessage(channel, thread_ts, text) {
-  if (!config.slack.botToken) {
-    console.warn('[slack] SLACK_BOT_TOKEN not set — skipping reply');
-    return;
-  }
-  const res = await fetch('https://slack.com/api/chat.postMessage', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.slack.botToken}`,
-    },
-    body: JSON.stringify({ channel, thread_ts, text }),
+  return res.status(410).json({
+    error: 'This Slack integration endpoint has been retired.',
   });
-  const data = await res.json();
-  if (!data.ok) {
-    throw new Error(`Slack postMessage failed: ${data.error}`);
-  }
-  return data;
-}
+});
 
 module.exports = router;
