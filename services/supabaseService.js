@@ -522,14 +522,44 @@ async function searchChunksWithTitleBoost(clientId, queryEmbedding, question, { 
 
 // member_id references Relativity_Global.client_members.id — stored as a plain UUID
 // because cross-project foreign keys are not supported in Supabase.
-async function createChatSession(clientId, title, memberId = null) {
+// origin/originMetadata/idempotencyKey (Architecture Review Phase 4,
+// Milestone 4, migrations/005_slack_origin_tracking.sql) are optional and
+// only ever set by non-portal callers (currently: Slack, via
+// services/runKnowledgeQuery.js). Portal sessions keep leaving all three
+// null, unchanged from before this migration.
+async function createChatSession(clientId, title, memberId = null, { origin = null, originMetadata = null, idempotencyKey = null } = {}) {
   const { data, error } = await aikbSupabase
     .from('knowledge_chat_sessions')
-    .insert({ client_id: clientId, title, member_id: memberId })
+    .insert({
+      client_id: clientId,
+      title,
+      member_id: memberId,
+      origin,
+      origin_metadata: originMetadata,
+      idempotency_key: idempotencyKey,
+    })
     .select()
     .single();
   if (error) throw new Error(`createChatSession: ${error.message}`);
   return data;
+}
+
+// Used only by the Slack /ask path (services/runKnowledgeQuery.js) to
+// detect a retried/duplicate delivery (e.g. a redelivered Inngest step, or
+// the Relativity Cron sweep re-calling POST /ask for a stuck event) and
+// return the already-computed answer instead of re-running retrieval/
+// generation. idempotency_key is unique (partial index, NULLs excluded), so
+// this returns at most one row.
+async function getChatSessionByIdempotencyKey(clientId, idempotencyKey) {
+  if (!idempotencyKey) return null;
+  const { data, error } = await aikbSupabase
+    .from('knowledge_chat_sessions')
+    .select('*')
+    .eq('client_id', clientId)
+    .eq('idempotency_key', idempotencyKey)
+    .maybeSingle();
+  if (error) throw new Error(`getChatSessionByIdempotencyKey: ${error.message}`);
+  return data || null;
 }
 
 // memberId + isAdmin control visibility:
@@ -868,6 +898,7 @@ module.exports = {
   validateAuthToken,
   getMemberByAuthUser,
   createChatSession,
+  getChatSessionByIdempotencyKey,
   getChatSession,
   listChatSessions,
   updateChatSessionTitle,

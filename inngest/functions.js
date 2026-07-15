@@ -7,6 +7,8 @@ const supabaseService = require('../services/supabaseService');
 const openaiService = require('../services/openaiService');
 const documentParser = require('../services/documentParser');
 const chunkService = require('../services/chunkService');
+const { runKnowledgeQuery } = require('../services/runKnowledgeQuery');
+const relativityDeliverClient = require('../services/relativityDeliverClient');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -391,6 +393,89 @@ const reindexDocument = inngest.createFunction(
   }
 );
 
-const functions = [ingestDocument, deleteDocument, reindexDocument];
+// ---------------------------------------------------------------------------
+// Function 4: knowledge/slack.question.requested
+//
+// Architecture Review Phase 4, Milestone 4 (§4.8-§4.9). Triggered by
+// POST /api/knowledge/ask's fast accept-and-enqueue call. Runs the SAME
+// shared RAG pipeline /query uses (services/runKnowledgeQuery.js — not a
+// duplicated implementation), then calls back to Relativity's
+// POST /api/integrations/slack/deliver with the result. Relativity owns
+// ALL Slack-specific formatting and delivery (§4.2) — this function never
+// calls Slack's API and never sees a bot token.
+//
+// step.run granularity matters here: if 'deliver-to-relativity' fails and
+// Inngest retries the function, 'run-knowledge-query's already-persisted
+// return value is reused rather than re-run — no second OpenAI call, no
+// risk of a second (differently-worded) answer for the same event. Even if
+// this function is retried after 'run-knowledge-query' already completed
+// on a prior attempt, runKnowledgeQuery's own idempotencyKey short-circuit
+// (services/runKnowledgeQuery.js, migrations/005_slack_origin_tracking.sql)
+// means calling it again is still safe.
+// ---------------------------------------------------------------------------
 
-module.exports = { functions, ingestDocument, deleteDocument, reindexDocument };
+const slackQuestionRequested = inngest.createFunction(
+  {
+    id: 'knowledge-slack-question-requested',
+    name: 'Answer Slack Question',
+    concurrency: { limit: 5, key: 'event.data.clientId' },
+    retries: 3,
+    onFailure: async ({ event, error }) => {
+      // Inngest's own retries are exhausted. Tell Relativity now, rather
+      // than making the user wait for Relativity's own Cron sweep to
+      // notice — Relativity posts the safe "couldn't complete that
+      // request" fallback from this callback.
+      const { clientId, idempotencyKey } = (event && event.data && event.data.event && event.data.event.data) || {};
+      console.error('[slack-question] onFailure', { clientId, error: error && error.message });
+      if (clientId && idempotencyKey) {
+        try {
+          await relativityDeliverClient.deliverResult({
+            clientId,
+            idempotencyKey,
+            payload: { error: true, errorCode: 'AIKB_PROCESSING_FAILED' },
+          });
+        } catch (deliverErr) {
+          console.error('[slack-question] onFailure deliver callback also failed', { error: deliverErr.message });
+        }
+      }
+    },
+  },
+  { event: 'knowledge/slack.question.requested' },
+  async ({ event, step }) => {
+    const { clientId, question, idempotencyKey, originMetadata } = event.data;
+
+    if (!clientId) throw new Error('clientId is required');
+    if (!question) throw new Error('question is required');
+    if (!idempotencyKey) throw new Error('idempotencyKey is required');
+
+    const result = await step.run('run-knowledge-query', async () => {
+      return runKnowledgeQuery({
+        clientId,
+        question,
+        origin: 'slack',
+        originMetadata,
+        idempotencyKey,
+      });
+    });
+
+    await step.run('deliver-to-relativity', async () => {
+      await relativityDeliverClient.deliverResult({
+        clientId,
+        idempotencyKey,
+        payload: {
+          answer: result.answer,
+          sources: result.sources,
+          isKnowledgeGap: result.isKnowledgeGap,
+          gapReason: result.gapReason || null,
+          sessionId: result.sessionId,
+        },
+      });
+    });
+
+    return { delivered: true, sessionId: result.sessionId, isKnowledgeGap: result.isKnowledgeGap };
+  }
+);
+
+const functions = [ingestDocument, deleteDocument, reindexDocument, slackQuestionRequested];
+
+module.exports = { functions, ingestDocument, deleteDocument, reindexDocument, slackQuestionRequested };

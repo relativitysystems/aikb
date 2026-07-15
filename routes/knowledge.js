@@ -3,16 +3,12 @@
 const express = require('express');
 const { inngest } = require('../inngest/client');
 const supabaseService = require('../services/supabaseService');
-const openaiService = require('../services/openaiService');
 const config = require('../config');
 const { requireMemberContext } = require('../middleware/resolveContext');
+const { requireServiceRequest } = require('../middleware/serviceRequest');
+const { runKnowledgeQuery, isAdminRole } = require('../services/runKnowledgeQuery');
 
 const router = express.Router();
-
-// Returns true for roles that can see/manage all sessions under a client.
-function isAdminRole(role) {
-  return role === 'owner' || role === 'admin';
-}
 
 // ---------------------------------------------------------------------------
 // API key middleware
@@ -251,36 +247,6 @@ router.get('/analytics/:clientId', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// isKnowledgeGapAnswer
-// Returns true when the LLM answer indicates the question is not covered by
-// the knowledge base, even though some chunks were retrieved (weak matches).
-// ---------------------------------------------------------------------------
-
-function isKnowledgeGapAnswer(answer) {
-  const normalized = answer.toLowerCase();
-  return [
-    'not documented in',
-    'not found in',
-    'couldn\'t find',
-    'could not find',
-    'no information in',
-    'not in the knowledge base',
-    'not available in the knowledge base',
-    'not provided in the documentation',
-    'there is no information',
-  ].some((phrase) => normalized.includes(phrase));
-}
-
-// Replaces any "Source: <filename>" line with "Source: N/A".
-// If no Source line exists, appends one so the response format stays consistent.
-function normalizeGapAnswerSource(answer) {
-  if (/^Source\s*:/im.test(answer)) {
-    return answer.replace(/^Source\s*:\s*.*$/gim, 'Source: N/A');
-  }
-  return `${answer}\n\nSource: N/A`;
-}
-
-// ---------------------------------------------------------------------------
 // POST /api/knowledge/query
 // Synchronous RAG query: vector search + LLM answer.
 // Body: { clientId, question, sessionId? }
@@ -288,6 +254,14 @@ function normalizeGapAnswerSource(answer) {
 // rather than trusted from the request body, so follow-up questions can be
 // classified/retrieved using the actual prior conversation.
 // Returns: { answer, sources, sessionId }
+//
+// The actual pipeline (session resolution, intent classification, retrieval,
+// generation, gap detection, message persistence) lives in
+// services/runKnowledgeQuery.js (Architecture Review Phase 4, Milestone 4,
+// §4.9) so it can be shared, unmodified, with POST /ask below. This route
+// is now a thin origin: 'portal' adapter around that shared function — its
+// request/response shape and behavior are unchanged from before the
+// refactor.
 // ---------------------------------------------------------------------------
 
 router.post('/query', requireMemberContext, async (req, res, next) => {
@@ -300,196 +274,63 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
     await supabaseService.requireActiveClient(clientId);
 
     const { memberId, memberRole } = req.context;
-    const isAdmin = isAdminRole(memberRole);
 
-    // Resolve or create the chat session
-    let sessionId;
-    if (providedSessionId) {
-      const session = await supabaseService.getChatSession(clientId, providedSessionId, memberId, isAdmin);
-      if (!session) {
-        return res.status(404).json({ error: 'Session not found' });
-      }
-      sessionId = session.id;
-    } else {
-      const title = question.trim().slice(0, 50);
-      const session = await supabaseService.createChatSession(clientId, title, memberId);
-      sessionId = session.id;
-    }
-
-    // Save the user message before running RAG so we have its ID for knowledge gap logging
-    const userMsg = await supabaseService.createChatMessage({
+    const result = await runKnowledgeQuery({
       clientId,
-      sessionId,
-      role: 'user',
-      content: question,
+      question,
+      sessionId: providedSessionId,
       memberId,
+      memberRole,
+      origin: 'portal',
     });
 
-    // Load recent session history server-side (not trusted from the request body) so
-    // follow-up questions can be classified/retrieved using the actual prior conversation.
-    // Excludes the message just saved above and any deleted messages; capped to a small
-    // window so prompts stay small.
-    const recentMessages = await supabaseService.listRecentChatMessages(clientId, sessionId, 8);
-    const recentSessionMessages = recentMessages
-      .filter((m) => m.id !== userMsg.id)
-      .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
 
-    // Classify intent before running retrieval to avoid vector search on greetings,
-    // small talk, and help requests — these can never be answered from documents.
-    // Recent session messages let the classifier recognize follow-ups (e.g. "what should
-    // I do first") that reference a document/topic already established in this session.
-    const intent = await openaiService.classifyQueryIntent(question, recentSessionMessages);
+// ---------------------------------------------------------------------------
+// POST /api/knowledge/ask
+// Architecture Review Phase 4, Milestone 4 (§4.8-§4.10). The fast
+// accept-and-enqueue leg of the Slack Q&A flow — called synchronously by
+// Relativity's POST /api/integrations/slack/events handler, before it acks
+// Slack. Sits behind BOTH the existing router-level requireApiKey (line 36,
+// unchanged) AND requireServiceRequest (the additive HMAC envelope, §4.10) —
+// clientId/idempotencyKey come ONLY from the verified envelope
+// (req.serviceRequest), never from the request body directly.
+//
+// Does NOT compute the answer inline — it only enqueues
+// knowledge/slack.question.requested onto the existing Inngest pipeline
+// (inngest/functions.js) and returns immediately, so this stays fast enough
+// for Relativity's own Slack-ack budget.
+//
+// Never receives or forwards a Slack token/secret — only clientId, the
+// already-extracted question, and narrow origin metadata (§4.9).
+// ---------------------------------------------------------------------------
 
-    // The classifier has no visibility into what a client has actually uploaded — a
-    // knowledge base can contain poems, technical docs, school papers, etc., not just
-    // business SOPs. So a classifier verdict of "unsupported" is not trusted outright:
-    // if the client has indexed documents, retrieval still runs, and we only fall back
-    // to the unsupported response if retrieval genuinely finds nothing relevant.
-    let runRetrieval = intent.shouldRunRetrieval;
-    if (!runRetrieval && intent.intent === 'unsupported') {
-      runRetrieval = await supabaseService.hasIndexedDocuments(clientId);
+router.post('/ask', requireServiceRequest, async (req, res, next) => {
+  try {
+    const { clientId, idempotencyKey } = req.serviceRequest;
+    const { question, originMetadata } = req.servicePayload || {};
+
+    if (!question || typeof question !== 'string') {
+      return res.status(400).json({ error: 'question is required' });
     }
 
-    console.log('[query] intent classification', {
-      question,
-      clientId,
-      sessionContextMessages: recentSessionMessages.length,
-      intent: intent.intent,
-      confidence: intent.confidence,
-      classifierShouldRunRetrieval: intent.shouldRunRetrieval,
-      retrievalSkipped: !runRetrieval,
-      reason: intent.reason,
-    });
+    await supabaseService.requireActiveClient(clientId);
 
-    if (!runRetrieval) {
-      const answer = openaiService.buildNonRetrievalAnswer(question, intent);
-      await supabaseService.createChatMessage({
+    const event = await inngest.send({
+      name: 'knowledge/slack.question.requested',
+      data: {
         clientId,
-        sessionId,
-        role: 'assistant',
-        content: answer,
-        sources: [],
-        metadata: { question, retrievalQuery: null, intent, retrievalSkipped: true },
-        memberId,
-      });
-      return res.json({
-        answer,
-        sources: [],
-        sessionId,
-        isKnowledgeGap: false,
-        isConversational: intent.intent === 'casual_conversation',
-        intent,
-        userMessageId: userMsg.id,
-      });
-    }
-
-    // Rewrite the retrieval query using session context so follow-ups (e.g. "what about
-    // the checklist") search using the topic/document established earlier in the session.
-    // The original user question is still what gets answered — only retrieval uses this.
-    const retrievalQuery = await openaiService.buildRetrievalQuery(question, recentSessionMessages);
-
-    // 1. Embed the (possibly rewritten) retrieval query
-    const queryEmbedding = await openaiService.embedQuery(retrievalQuery);
-
-    // 2. Retrieve relevant chunks scoped to this client. If the retrieval query references
-    // a document by title/filename (e.g. "the collaborative response document"),
-    // that document's chunks are guaranteed to be included and ranked first.
-    const { chunks, matchedDocumentIds } = await supabaseService.searchChunksWithTitleBoost(
-      clientId, queryEmbedding, retrievalQuery, { threshold: 0.15, count: 10 }
-    );
-
-    console.log('[query] retrieval summary', {
-      question,
-      retrievalQuery,
-      intent: intent.intent,
-      retrievalSkipped: false,
-      titleMatchedDocumentIds: matchedDocumentIds,
-      chunkCount: chunks.length,
-      retrievedChunks: chunks.map((c) => ({
-        documentId: c.document_id,
-        fileName: c.metadata?.fileName ?? null,
-        similarity: c.similarity,
-        titleMatched: !!c.titleMatched,
-      })),
-      topScore: chunks[0]?.similarity ?? null,
-      topSource: chunks[0]?.metadata?.fileName ?? null,
-      topPage: chunks[0]?.metadata?.pageNumber ?? null,
+        question,
+        idempotencyKey,
+        originMetadata: originMetadata && typeof originMetadata === 'object' ? originMetadata : null,
+      },
     });
 
-    if (!chunks.length) {
-      const answer = normalizeGapAnswerSource('I couldn\'t find any relevant information in the knowledge base for your question.');
-      await supabaseService.createChatMessage({
-        clientId,
-        sessionId,
-        role: 'assistant',
-        content: answer,
-        sources: [],
-        metadata: { question, retrievalQuery, intent, retrievalSkipped: false },
-        memberId,
-      });
-      return res.json({ answer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'no_chunks_found', userMessageId: userMsg.id, intent });
-    }
-
-    // 3. Generate answer — always answers the original question, using session
-    // messages only to understand context, and chunks as the sole source of facts.
-    const answer = await openaiService.generateRagAnswer(question, chunks, recentSessionMessages);
-
-    // 4. Build sources list (deduplicated by documentId, with page numbers when available)
-    const sourceMap = new Map();
-    for (const chunk of chunks) {
-      const name = chunk.metadata && chunk.metadata.fileName ? chunk.metadata.fileName : 'unknown';
-      const docId = chunk.document_id;
-      if (!sourceMap.has(docId)) {
-        sourceMap.set(docId, { fileName: name, documentId: docId, pages: new Set() });
-      }
-      if (chunk.metadata && chunk.metadata.pageNumber != null) {
-        sourceMap.get(docId).pages.add(chunk.metadata.pageNumber);
-      }
-    }
-    const sources = Array.from(sourceMap.values()).map((s) => {
-      const src = { fileName: s.fileName, documentId: s.documentId };
-      if (s.pages.size > 0) {
-        src.pages = Array.from(s.pages).sort((a, b) => a - b);
-      }
-      return src;
-    });
-
-    const chunkMetadata = {
-      question,
-      retrievalQuery,
-      chunkCount: chunks.length,
-      documentIds: [...new Set(chunks.map((c) => c.document_id))],
-    };
-    const isGap = isKnowledgeGapAnswer(answer);
-
-    if (isGap) {
-      // The LLM indicated this question isn't covered despite chunks being retrieved
-      // (weak vector match). Normalize the Source line, return no sources.
-      const normalizedAnswer = normalizeGapAnswerSource(answer);
-      await supabaseService.createChatMessage({
-        clientId,
-        sessionId,
-        role: 'assistant',
-        content: normalizedAnswer,
-        sources: [],
-        metadata: { ...chunkMetadata, intent, retrievalSkipped: false },
-        memberId,
-      });
-      return res.json({ answer: normalizedAnswer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'answer_indicated_not_found', userMessageId: userMsg.id, intent });
-    }
-
-    // 5. Save the assistant message with real sources and chunk metadata
-    await supabaseService.createChatMessage({
-      clientId,
-      sessionId,
-      role: 'assistant',
-      content: answer,
-      sources,
-      metadata: { ...chunkMetadata, intent, retrievalSkipped: false },
-      memberId,
-    });
-
-    res.json({ answer, sources, sessionId, isKnowledgeGap: false, userMessageId: userMsg.id, intent });
+    res.json({ accepted: true, eventId: event.ids?.[0] || event.id || null });
   } catch (err) {
     next(err);
   }

@@ -40,6 +40,22 @@ const config = {
   },
   maxUploadBytes: parseInt(process.env.MAX_UPLOAD_BYTES || String(10 * 1024 * 1024), 10),
   apiKey: process.env.API_KEY,
+  // Architecture Review Phase 4, Milestone 4 (§4.10) — the additive
+  // HMAC-signed envelope shared with Relativity, scoped only to POST
+  // /api/knowledge/ask (verified here) and POST
+  // /api/integrations/slack/deliver (signed here, verified by Relativity).
+  // Must match Relativity's SERVICE_REQUEST_SIGNING_SECRET exactly.
+  serviceRequest: {
+    signingSecret: process.env.SERVICE_REQUEST_SIGNING_SECRET,
+  },
+  // Relativity's base URL, used only to call back
+  // POST /api/integrations/slack/deliver once a Slack-originated question
+  // has an answer (services/relativityDeliverClient.js). AIKB never calls
+  // any other Relativity route.
+  relativity: {
+    apiBaseUrl: process.env.RELATIVITY_API_BASE_URL,
+    deliverTimeoutMs: parseInt(process.env.RELATIVITY_DELIVER_TIMEOUT_MS || '8000', 10),
+  },
 };
 
 module.exports = config;
