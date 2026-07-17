@@ -160,9 +160,19 @@ const ingestDocument = inngest.createFunction(
             }
           }
 
-          // Upsert document record
+          // Upsert document record. collectionId is only resolved/passed on
+          // a true first-insert (existing is falsy here) — a reindex of an
+          // already-moved document must never reset its collection back to
+          // General (see upsertKnowledgeDocument's "only write when truthy"
+          // handling of this param).
+          let newDocCollectionId;
+          if (!existing) {
+            const defaultCollection = await supabaseService.getDefaultCollection(clientId);
+            newDocCollectionId = defaultCollection.id;
+          }
           const doc = await supabaseService.upsertKnowledgeDocument(
-            clientId, sourceProvider, sourceFileId, fileName, resolvedMimeType, contentHash, storagePath || undefined
+            clientId, sourceProvider, sourceFileId, fileName, resolvedMimeType, contentHash,
+            storagePath || undefined, newDocCollectionId
           );
           localDocumentId = doc.id;
 
@@ -442,7 +452,7 @@ const slackQuestionRequested = inngest.createFunction(
   },
   { event: 'knowledge/slack.question.requested' },
   async ({ event, step }) => {
-    const { clientId, question, idempotencyKey, originMetadata } = event.data;
+    const { clientId, question, idempotencyKey, originMetadata, allowedCollectionIds } = event.data;
 
     if (!clientId) throw new Error('clientId is required');
     if (!question) throw new Error('question is required');
@@ -455,6 +465,10 @@ const slackQuestionRequested = inngest.createFunction(
         origin: 'slack',
         originMetadata,
         idempotencyKey,
+        // Fail-closed: always an explicit array by the time /ask enqueued
+        // this event (see routes/knowledge.js POST /ask), but re-guarded
+        // here too rather than trusting event.data shape blindly.
+        allowedCollectionIds: Array.isArray(allowedCollectionIds) ? allowedCollectionIds : [],
       });
     });
 

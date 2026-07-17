@@ -98,7 +98,7 @@ async function getIngestionJobsByClient(clientId) {
 
 async function upsertKnowledgeDocument(
   clientId, provider, fileId, fileName, mimeType, contentHash,
-  storagePath = undefined
+  storagePath = undefined, collectionId = undefined
 ) {
   const now = new Date().toISOString();
   const payload = {
@@ -112,6 +112,10 @@ async function upsertKnowledgeDocument(
     updated_at: now,
   };
   if (storagePath) payload.storage_path = storagePath; // only write when truthy; never overwrite with null
+  // Only write when truthy; never overwrite with null. Callers only pass this
+  // on a true first-insert (see inngest/functions.js) so a reindex of an
+  // already-moved document never resets its collection back to General.
+  if (collectionId) payload.collection_id = collectionId;
   const { data, error } = await aikbSupabase
     .from('knowledge_documents')
     .upsert(payload, { onConflict: 'client_id,source_provider,source_file_id' })
@@ -320,6 +324,135 @@ async function getDistinctClientIds() {
 }
 
 // ---------------------------------------------------------------------------
+// Knowledge collections (Milestone 5)
+//
+// Org-scoped (client_id-scoped) grouping for knowledge_documents, used to
+// restrict what a given channel (currently: Slack) is allowed to search.
+// Every client gets two seeded collections — "General" (is_default: true,
+// the fallback target for new uploads) and "Slack" (an ordinary starter
+// collection). ensureDefaultCollections is idempotent and safe to call
+// unconditionally on every collections read/write path and from the ingest
+// pipeline, so a client's collections never depend on a one-time migration
+// having covered it (new clients are seeded lazily, on first use).
+// ---------------------------------------------------------------------------
+
+async function ensureDefaultCollections(clientId) {
+  const { error: upsertError } = await aikbSupabase
+    .from('knowledge_collections')
+    .upsert(
+      [
+        { client_id: clientId, name: 'General', is_default: true },
+        { client_id: clientId, name: 'Slack', is_default: false },
+      ],
+      { onConflict: 'client_id,name', ignoreDuplicates: true }
+    );
+  if (upsertError) throw new Error(`ensureDefaultCollections: ${upsertError.message}`);
+
+  const { data, error } = await aikbSupabase
+    .from('knowledge_collections')
+    .select('*')
+    .eq('client_id', clientId)
+    .order('is_default', { ascending: false })
+    .order('name', { ascending: true });
+  if (error) throw new Error(`ensureDefaultCollections (reselect): ${error.message}`);
+  return data;
+}
+
+async function getDefaultCollection(clientId) {
+  const collections = await ensureDefaultCollections(clientId);
+  return collections.find((c) => c.is_default) || collections[0];
+}
+
+async function listCollectionsWithCounts(clientId) {
+  const collections = await ensureDefaultCollections(clientId);
+
+  const { data: docs, error } = await aikbSupabase
+    .from('knowledge_documents')
+    .select('collection_id')
+    .eq('client_id', clientId)
+    .neq('status', 'deleted');
+  if (error) throw new Error(`listCollectionsWithCounts: ${error.message}`);
+
+  const counts = new Map();
+  for (const doc of docs || []) {
+    counts.set(doc.collection_id, (counts.get(doc.collection_id) || 0) + 1);
+  }
+
+  return collections.map((c) => ({ ...c, documentCount: counts.get(c.id) || 0 }));
+}
+
+async function getCollectionById(collectionId) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_collections')
+    .select('*')
+    .eq('id', collectionId)
+    .maybeSingle();
+  if (error) throw new Error(`getCollectionById: ${error.message}`);
+  return data;
+}
+
+async function createCollection(clientId, name) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_collections')
+    .insert({ client_id: clientId, name })
+    .select()
+    .single();
+  if (error) {
+    if (error.code === '23505') {
+      const dupErr = new Error('A collection with this name already exists.');
+      dupErr.code = 'DUPLICATE_NAME';
+      throw dupErr;
+    }
+    throw new Error(`createCollection: ${error.message}`);
+  }
+  return data;
+}
+
+async function renameCollection(collectionId, name) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_collections')
+    .update({ name, updated_at: new Date().toISOString() })
+    .eq('id', collectionId)
+    .select()
+    .single();
+  if (error) {
+    if (error.code === '23505') {
+      const dupErr = new Error('A collection with this name already exists.');
+      dupErr.code = 'DUPLICATE_NAME';
+      throw dupErr;
+    }
+    throw new Error(`renameCollection: ${error.message}`);
+  }
+  return data;
+}
+
+async function deleteCollection(collectionId) {
+  const { error } = await aikbSupabase
+    .from('knowledge_collections')
+    .delete()
+    .eq('id', collectionId);
+  if (error) {
+    if (error.code === '23503') {
+      const notEmptyErr = new Error('Collection is not empty.');
+      notEmptyErr.code = 'NOT_EMPTY';
+      throw notEmptyErr;
+    }
+    throw new Error(`deleteCollection: ${error.message}`);
+  }
+}
+
+async function moveDocumentCollection(documentId, collectionId) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_documents')
+    .update({ collection_id: collectionId, updated_at: new Date().toISOString() })
+    .eq('id', documentId)
+    .select()
+    .single();
+  if (error) throw new Error(`moveDocumentCollection: ${error.message}`);
+  return data;
+}
+
+// ---------------------------------------------------------------------------
 // Chunks
 // ---------------------------------------------------------------------------
 
@@ -421,12 +554,18 @@ async function requireActiveClient(clientId) {
 // Vector search
 // ---------------------------------------------------------------------------
 
-async function searchChunks(clientId, queryEmbedding, { threshold = 0.15, count = 10 } = {}) {
+// allowedCollectionIds: null/undefined = no restriction (searches every
+// collection — the portal's behavior). An array (including an empty one)
+// restricts the match_knowledge_chunks RPC's own SQL WHERE clause to those
+// collections — filtering happens inside that single query, never as an
+// app-layer post-filter, so a restricted chunk is never fetched at all.
+async function searchChunks(clientId, queryEmbedding, { threshold = 0.15, count = 10, allowedCollectionIds = null } = {}) {
   const { data, error } = await aikbSupabase.rpc('match_knowledge_chunks', {
     query_embedding: queryEmbedding,
     match_client_id: clientId,
     match_threshold: threshold,
     match_count: count,
+    match_collection_ids: allowedCollectionIds,
   });
   if (error) throw new Error(`searchChunks: ${error.message}`);
   return data;
@@ -483,10 +622,17 @@ function matchDocumentsByTitle(question, documents) {
  * included (and ranked first) even if their cosine similarity falls under the
  * default threshold or outside the top-N vector matches.
  */
-async function searchChunksWithTitleBoost(clientId, queryEmbedding, question, { threshold = 0.15, count = 10 } = {}) {
-  const vectorMatches = await searchChunks(clientId, queryEmbedding, { threshold, count });
+async function searchChunksWithTitleBoost(clientId, queryEmbedding, question, { threshold = 0.15, count = 10, allowedCollectionIds = null } = {}) {
+  const vectorMatches = await searchChunks(clientId, queryEmbedding, { threshold, count, allowedCollectionIds });
 
-  const documents = await getDocumentsByClient(clientId);
+  let documents = await getDocumentsByClient(clientId);
+  // Scope the title-boost candidate pool the same way the vector-search leg
+  // above is scoped, so a restricted document's title can never force its
+  // chunks into the result set via this secondary path.
+  if (Array.isArray(allowedCollectionIds)) {
+    const allowed = new Set(allowedCollectionIds);
+    documents = documents.filter((d) => allowed.has(d.collection_id));
+  }
   const matchedDocumentIds = matchDocumentsByTitle(question, documents);
 
   if (!matchedDocumentIds.length) {
@@ -849,6 +995,10 @@ async function deleteAllClientData(clientId) {
     'knowledge_chunks',
     'knowledge_ingestion_jobs',
     'knowledge_documents',
+    // Must come after knowledge_documents — collection_id is a real FK
+    // (ON DELETE RESTRICT) within this same database, unlike the other
+    // cross-project columns in this file.
+    'knowledge_collections',
   ];
   const tableResults = {};
   for (const table of tables) {
@@ -887,6 +1037,14 @@ module.exports = {
   markDocumentDeleted,
   markDocumentError,
   getDistinctClientIds,
+  ensureDefaultCollections,
+  getDefaultCollection,
+  listCollectionsWithCounts,
+  getCollectionById,
+  createCollection,
+  renameCollection,
+  deleteCollection,
+  moveDocumentCollection,
   deleteChunksForDocument,
   insertKnowledgeChunks,
   searchChunks,

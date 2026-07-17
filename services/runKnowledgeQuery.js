@@ -13,11 +13,16 @@
 // response shape ({ answer, sources, sessionId, isKnowledgeGap, gapReason?,
 // userMessageId, intent, isConversational? }).
 //
-// Retrieval scope for Slack traffic in this milestone is the SAME as the
-// portal today — every document belonging to the organization, client_id-
-// scoped exactly as searchChunksWithTitleBoost already enforces. This
-// milestone does not add a "General"-only collection restriction (see the
-// architecture report §4.9/§2.5 — deferred, optional hardening).
+// Retrieval scope (Milestone 5, Knowledge Collections): callers may pass
+// allowedCollectionIds to restrict retrieval to a subset of a client's
+// knowledge_collections. null/undefined (the portal's default — /query
+// never sets this) means no restriction, searching every collection,
+// unchanged from before this milestone. An explicit array (including an
+// empty one, which Slack sends when zero collections are allowed) restricts
+// searchChunksWithTitleBoost's underlying SQL query itself — see
+// aikb/migrations/006_knowledge_collections.sql's match_knowledge_chunks —
+// so a restricted chunk is never fetched, and therefore never reaches the
+// LLM prompt built below.
 
 const defaultSupabaseService = require('./supabaseService');
 const defaultOpenaiService = require('./openaiService');
@@ -90,6 +95,7 @@ async function replayExistingSession({ supabaseService, clientId, session }) {
  * @param {'portal'|'slack'} [params.origin]
  * @param {object|null} [params.originMetadata] - narrow, safe metadata only (never a token/secret).
  * @param {string|null} [params.idempotencyKey] - Slack: "slack:<event_id>". Never used for portal today.
+ * @param {string[]|null} [params.allowedCollectionIds] - null = no restriction (portal default); an array (possibly empty) restricts retrieval.
  * @param {object} [params.deps] - DI'd for tests; each defaults to the real singleton service.
  */
 async function runKnowledgeQuery({
@@ -101,6 +107,7 @@ async function runKnowledgeQuery({
   origin = 'portal',
   originMetadata = null,
   idempotencyKey = null,
+  allowedCollectionIds = null,
   deps = {},
 }) {
   const supabaseService = deps.supabaseService || defaultSupabaseService;
@@ -199,7 +206,7 @@ async function runKnowledgeQuery({
   const queryEmbedding = await openaiService.embedQuery(retrievalQuery);
 
   const { chunks, matchedDocumentIds } = await supabaseService.searchChunksWithTitleBoost(
-    clientId, queryEmbedding, retrievalQuery, { threshold: 0.15, count: 10 }
+    clientId, queryEmbedding, retrievalQuery, { threshold: 0.15, count: 10, allowedCollectionIds }
   );
 
   console.log('[runKnowledgeQuery] retrieval summary', {

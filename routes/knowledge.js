@@ -200,6 +200,150 @@ router.get('/documents/:clientId', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// Knowledge collections (Milestone 5)
+//
+// Organization-wide (client_id-scoped), not member-scoped — same trust
+// pattern as the document routes above: gated only by the router-level
+// requireApiKey, since Relativity is the trusted server-to-server caller
+// and enforces owner/admin-only access itself before calling these.
+// ---------------------------------------------------------------------------
+
+// GET /api/knowledge/collections/:clientId
+router.get('/collections/:clientId', async (req, res, next) => {
+  try {
+    const { clientId } = req.params;
+    await supabaseService.requireActiveClient(clientId);
+    const collections = await supabaseService.listCollectionsWithCounts(clientId);
+    res.json({ collections });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/knowledge/collections
+// Body: { clientId, name }
+router.post('/collections', async (req, res, next) => {
+  try {
+    const { clientId, name } = req.body;
+    const trimmed = typeof name === 'string' ? name.trim() : '';
+    if (!clientId || !trimmed) {
+      return res.status(400).json({ error: 'clientId and name are required' });
+    }
+    if (trimmed.length > 100) {
+      return res.status(400).json({ error: 'name must be 100 characters or fewer' });
+    }
+    await supabaseService.requireActiveClient(clientId);
+    const collection = await supabaseService.createCollection(clientId, trimmed);
+    res.status(201).json({ collection });
+  } catch (err) {
+    if (err.code === 'DUPLICATE_NAME') {
+      return res.status(409).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+// PATCH /api/knowledge/collections/:id
+// Body: { clientId, name }
+router.patch('/collections/:id', async (req, res, next) => {
+  try {
+    const { clientId, name } = req.body;
+    const trimmed = typeof name === 'string' ? name.trim() : '';
+    if (!clientId || !trimmed) {
+      return res.status(400).json({ error: 'clientId and name are required' });
+    }
+    if (trimmed.length > 100) {
+      return res.status(400).json({ error: 'name must be 100 characters or fewer' });
+    }
+    await supabaseService.requireActiveClient(clientId);
+
+    const collection = await supabaseService.getCollectionById(req.params.id);
+    if (!collection) return res.status(404).json({ error: 'Collection not found.' });
+    if (collection.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
+
+    const updated = await supabaseService.renameCollection(req.params.id, trimmed);
+    res.json({ collection: updated });
+  } catch (err) {
+    if (err.code === 'DUPLICATE_NAME') {
+      return res.status(409).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+// DELETE /api/knowledge/collections/:id
+// Body: { clientId }
+// Refuses to delete the default ("General") collection, and refuses to
+// delete a non-empty collection (defense in depth: the FK is also
+// ON DELETE RESTRICT at the DB level — see migrations/006).
+router.delete('/collections/:id', async (req, res, next) => {
+  try {
+    const { clientId } = req.body || {};
+    if (!clientId) return res.status(400).json({ error: 'clientId is required' });
+    await supabaseService.requireActiveClient(clientId);
+
+    const collection = await supabaseService.getCollectionById(req.params.id);
+    if (!collection) return res.status(404).json({ error: 'Collection not found.' });
+    if (collection.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
+    if (collection.is_default) {
+      return res.status(400).json({ error: 'The default collection cannot be deleted.' });
+    }
+
+    const withCounts = await supabaseService.listCollectionsWithCounts(clientId);
+    const match = withCounts.find((c) => c.id === req.params.id);
+    if (match && match.documentCount > 0) {
+      return res.status(409).json({ error: 'Collection is not empty.' });
+    }
+
+    await supabaseService.deleteCollection(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    if (err.code === 'NOT_EMPTY') {
+      return res.status(409).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /api/knowledge/document/:id/collection
+// Move a document to a different collection.
+// :id can be either the DB document UUID or 'by-source' for source-based lookup.
+// Body: { clientId, collectionId, sourceFileId?, sourceProvider? }
+// ---------------------------------------------------------------------------
+
+router.patch('/document/:id/collection', async (req, res, next) => {
+  try {
+    const documentId = req.params.id !== 'by-source' ? req.params.id : undefined;
+    const { clientId, collectionId, sourceFileId, sourceProvider = 'portal_upload' } = req.body || {};
+
+    if (!clientId || !collectionId) {
+      return res.status(400).json({ error: 'clientId and collectionId are required' });
+    }
+    if (!documentId && !sourceFileId) {
+      return res.status(400).json({ error: 'Provide either a document UUID as :id or sourceFileId in the body' });
+    }
+
+    await supabaseService.requireActiveClient(clientId);
+
+    const doc = documentId
+      ? await supabaseService.getKnowledgeDocumentById(documentId)
+      : await supabaseService.getKnowledgeDocumentBySourceId(clientId, sourceProvider, sourceFileId);
+    if (!doc) return res.status(404).json({ error: 'Document not found.' });
+    if (doc.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
+
+    const collection = await supabaseService.getCollectionById(collectionId);
+    if (!collection) return res.status(404).json({ error: 'Collection not found.' });
+    if (collection.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
+
+    const updated = await supabaseService.moveDocumentCollection(doc.id, collectionId);
+    res.json({ document: updated });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // GET /api/knowledge/jobs/:clientId
 // List recent ingestion jobs for a client.
 // ---------------------------------------------------------------------------
@@ -266,7 +410,7 @@ router.get('/analytics/:clientId', async (req, res, next) => {
 
 router.post('/query', requireMemberContext, async (req, res, next) => {
   try {
-    const { clientId, question, sessionId: providedSessionId } = req.body;
+    const { clientId, question, sessionId: providedSessionId, allowedCollectionIds } = req.body;
     if (!clientId || !question) {
       return res.status(400).json({ error: 'clientId and question are required' });
     }
@@ -282,6 +426,10 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
       memberId,
       memberRole,
       origin: 'portal',
+      // Omitted (undefined/null) => no restriction, searches every
+      // collection — this is the portal's unchanged default behavior. Only
+      // an explicit array restricts retrieval.
+      allowedCollectionIds: Array.isArray(allowedCollectionIds) ? allowedCollectionIds : null,
     });
 
     res.json(result);
@@ -312,7 +460,7 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
 router.post('/ask', requireServiceRequest, async (req, res, next) => {
   try {
     const { clientId, idempotencyKey } = req.serviceRequest;
-    const { question, originMetadata } = req.servicePayload || {};
+    const { question, originMetadata, allowedCollectionIds } = req.servicePayload || {};
 
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'question is required' });
@@ -327,6 +475,12 @@ router.post('/ask', requireServiceRequest, async (req, res, next) => {
         question,
         idempotencyKey,
         originMetadata: originMetadata && typeof originMetadata === 'object' ? originMetadata : null,
+        // Fail-closed: anything other than an explicit array (missing,
+        // malformed, wrong type) is treated as "zero allowed collections",
+        // never as "no restriction" — see match_knowledge_chunks in
+        // migrations/006_knowledge_collections.sql for why an empty array
+        // is safe (it matches nothing, not everything).
+        allowedCollectionIds: Array.isArray(allowedCollectionIds) ? allowedCollectionIds : [],
       },
     });
 
