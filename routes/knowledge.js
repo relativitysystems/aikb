@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const express = require('express');
 const { inngest } = require('../inngest/client');
 const supabaseService = require('../services/supabaseService');
@@ -23,7 +24,14 @@ function requireApiKey(req, res, next) {
     return next();
   }
   const provided = req.headers['x-api-key'];
-  if (!provided || provided !== config.apiKey) {
+  if (!provided || typeof provided !== 'string') {
+    return res.status(401).json({ error: 'Invalid or missing API key' });
+  }
+  const providedBuf = Buffer.from(provided, 'utf8');
+  const expectedBuf = Buffer.from(config.apiKey, 'utf8');
+  const safeEqual = providedBuf.length === expectedBuf.length
+    && crypto.timingSafeEqual(providedBuf, expectedBuf);
+  if (!safeEqual) {
     return res.status(401).json({ error: 'Invalid or missing API key' });
   }
   next();
