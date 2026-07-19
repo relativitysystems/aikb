@@ -692,10 +692,11 @@ async function createChatSession(clientId, title, memberId = null, { origin = nu
 
 // Used only by the Slack /ask path (services/runKnowledgeQuery.js) to
 // detect a retried/duplicate delivery (e.g. a redelivered Inngest step, or
-// the Relativity Cron sweep re-calling POST /ask for a stuck event) and
-// return the already-computed answer instead of re-running retrieval/
-// generation. idempotency_key is unique (partial index, NULLs excluded), so
-// this returns at most one row.
+// one of Relativity's own bounded in-flow retries around POST /ask, per
+// ADR-007 — there is no scheduled sweep re-calling this) and return the
+// already-computed answer instead of re-running retrieval/generation.
+// idempotency_key is unique (partial index, NULLs excluded), so this
+// returns at most one row.
 async function getChatSessionByIdempotencyKey(clientId, idempotencyKey) {
   if (!idempotencyKey) return null;
   const { data, error } = await aikbSupabase
@@ -825,6 +826,49 @@ async function softDeleteAllChatHistory(clientId, memberId = null, isAdmin = fal
 
   const { error: msgError } = await msgQuery;
   if (msgError) throw new Error(`softDeleteAllChatHistory (messages): ${msgError.message}`);
+}
+
+// ADR-007 (Relativity's Architecture repo, decisions/ADR-007-SLACK-BOUNDED-DELIVERY-RETRY.md):
+// called by Relativity once a Slack event reaches the terminal
+// delivery_failed state, via POST /api/knowledge/chat/redact
+// (routes/knowledge.js). Redacts the customer content of the chat session
+// tied to this idempotency key — title, and every message's content/
+// sources/metadata (which carries the question, retrieval query, and
+// chunk/document references used to build the prompt) — while leaving the
+// session and message rows themselves in place: their ids, timestamps,
+// client_id/session_id linkage, origin/origin_metadata, and idempotency_key
+// are all technical/audit metadata, not customer content, and are exactly
+// what ADR-007 requires to be retained. knowledge_chat_messages.content is
+// NOT NULL, so it is replaced with a fixed redaction marker rather than
+// nulled, unlike the nullable session title.
+//
+// Idempotent and safe to call more than once (e.g. a retried /deliver
+// callback after a redaction already succeeded): a session with no
+// remaining un-redacted content is simply updated again with the same
+// values.
+const REDACTED_MESSAGE_CONTENT = '[redacted — Slack delivery failed, see ADR-007]';
+
+async function redactChatSessionByIdempotencyKey(clientId, idempotencyKey) {
+  const session = await getChatSessionByIdempotencyKey(clientId, idempotencyKey);
+  if (!session) {
+    return { redacted: false, reason: 'not_found' };
+  }
+
+  const { error: sessionError } = await aikbSupabase
+    .from('knowledge_chat_sessions')
+    .update({ title: null, updated_at: new Date().toISOString() })
+    .eq('id', session.id)
+    .eq('client_id', clientId);
+  if (sessionError) throw new Error(`redactChatSessionByIdempotencyKey (session): ${sessionError.message}`);
+
+  const { error: messagesError } = await aikbSupabase
+    .from('knowledge_chat_messages')
+    .update({ content: REDACTED_MESSAGE_CONTENT, sources: null, metadata: null })
+    .eq('session_id', session.id)
+    .eq('client_id', clientId);
+  if (messagesError) throw new Error(`redactChatSessionByIdempotencyKey (messages): ${messagesError.message}`);
+
+  return { redacted: true, sessionId: session.id };
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,6 +1106,7 @@ module.exports = {
   updateChatSessionTitle,
   softDeleteChatSession,
   softDeleteAllChatHistory,
+  redactChatSessionByIdempotencyKey,
   createChatMessage,
   listChatMessages,
   listRecentChatMessages,

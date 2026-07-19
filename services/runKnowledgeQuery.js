@@ -57,8 +57,9 @@ function normalizeGapAnswerSource(answer) {
  * Reconstructs a runKnowledgeQuery-shaped response from an already-persisted
  * session's most recent assistant message, without re-running retrieval/
  * generation. Used only for the idempotency short-circuit (§4.19) — a
- * retried Slack /ask call (e.g. a redelivered Inngest step, or the
- * Relativity Cron sweep) with the same idempotencyKey lands here instead of
+ * retried Slack /ask call (e.g. a redelivered Inngest step, or one of
+ * Relativity's own bounded in-flow retries around its accept-and-enqueue
+ * call, per ADR-007) with the same idempotencyKey lands here instead of
  * doing a second OpenAI round trip or risking a duplicate Slack reply.
  */
 async function replayExistingSession({ supabaseService, clientId, session }) {

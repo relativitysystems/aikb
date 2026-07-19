@@ -598,6 +598,33 @@ router.patch('/chat/sessions/:clientId/:sessionId/title', requireMemberContext, 
 });
 
 // ---------------------------------------------------------------------------
+// POST /api/knowledge/chat/redact
+// ADR-007 (Relativity's Architecture repo,
+// decisions/ADR-007-SLACK-BOUNDED-DELIVERY-RETRY.md). Called by Relativity
+// once a Slack event reaches the terminal delivery_failed state, to redact
+// this idempotency key's chat session content on the AIKB side (title,
+// message content/sources/metadata). Same auth model as POST /ask —
+// requireServiceRequest ADDITIVE to the router-level requireApiKey above —
+// clientId/idempotencyKey come ONLY from the verified envelope, never the
+// request body. No payload fields are read; the envelope alone identifies
+// what to redact. Idempotent: redacting an already-redacted or
+// never-created session is a safe no-op (redacted: false).
+// ---------------------------------------------------------------------------
+
+router.post('/chat/redact', requireServiceRequest, async (req, res, next) => {
+  try {
+    // requireServiceRequest (middleware/serviceRequest.js) already rejects
+    // any envelope missing idempotencyKey (or clientId) with 401 before
+    // req.serviceRequest is ever set — no redundant presence check needed here.
+    const { clientId, idempotencyKey } = req.serviceRequest;
+    const result = await supabaseService.redactChatSessionByIdempotencyKey(clientId, idempotencyKey);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/knowledge/gaps
 // Explicit save of a knowledge gap — called by the portal when the user
 // chooses to save. The query endpoint no longer writes gaps automatically.

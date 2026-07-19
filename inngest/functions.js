@@ -431,10 +431,12 @@ const slackQuestionRequested = inngest.createFunction(
     concurrency: { limit: 5, key: 'event.data.clientId' },
     retries: 3,
     onFailure: async ({ event, error }) => {
-      // Inngest's own retries are exhausted. Tell Relativity now, rather
-      // than making the user wait for Relativity's own Cron sweep to
-      // notice — Relativity posts the safe "couldn't complete that
-      // request" fallback from this callback.
+      // Inngest's own retries are exhausted — this is the "AIKB generation
+      // failure" path (ADR-007, Relativity's Architecture repo): tell
+      // Relativity now so it can post the safe "couldn't complete that
+      // request" fallback from this callback. There is no scheduled sweep
+      // on Relativity's side to notice this instead (removed per ADR-007) —
+      // this callback is the only notification path for this failure mode.
       const { clientId, idempotencyKey } = (event && event.data && event.data.event && event.data.event.data) || {};
       console.error('[slack-question] onFailure', { clientId, error: error && error.message });
       if (clientId && idempotencyKey) {
