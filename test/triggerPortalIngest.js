@@ -1,9 +1,14 @@
 'use strict';
 
 require('dotenv').config();
+const crypto = require('crypto');
+const { signServiceRequest } = require('../services/serviceRequestAuth');
 
 const BASE_URL     = process.env.BASE_URL          || 'http://localhost:3000';
 const API_KEY      = process.env.API_KEY            || '';
+// POST /ingest requires the same signed envelope as POST /ask (backlog H4)
+// — see middleware/serviceRequest.js.
+const SIGNING_SECRET = process.env.SERVICE_REQUEST_SIGNING_SECRET || '';
 
 // ---------------------------------------------------------------------------
 // Set these to match a real file uploaded to Supabase Storage
@@ -23,20 +28,27 @@ async function main() {
   console.log(`  server:       ${BASE_URL}`);
   console.log('');
 
+  const payload = {
+    sourceFileId: SOURCE_FILE_ID,
+    fileName: FILE_NAME,
+    mimeType: MIME_TYPE,
+    sourceProvider: 'portal_upload',
+    storagePath: STORAGE_PATH,
+  };
+  const envelope = signServiceRequest({
+    clientId: CLIENT_ID,
+    idempotencyKey: crypto.randomUUID(),
+    payload,
+    secret: SIGNING_SECRET,
+  });
+
   const res = await fetch(`${BASE_URL}/api/knowledge/ingest`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...(API_KEY ? { 'x-api-key': API_KEY } : {}),
     },
-    body: JSON.stringify({
-      clientId: CLIENT_ID,
-      sourceFileId: SOURCE_FILE_ID,
-      fileName: FILE_NAME,
-      mimeType: MIME_TYPE,
-      sourceProvider: 'portal_upload',
-      storagePath: STORAGE_PATH,
-    }),
+    body: JSON.stringify({ ...envelope, payload }),
   });
 
   const body = await res.json();

@@ -51,19 +51,27 @@ function sanitizeJobError(msg) {
 // ---------------------------------------------------------------------------
 // POST /api/knowledge/ingest
 // Trigger ingestion of a single document (portal upload only).
-// Body: { clientId, sourceFileId, fileName, mimeType, storagePath, sourceProvider? }
+// Backlog H4: requireServiceRequest ADDITIVE to the router-level
+// requireApiKey above — clientId/idempotencyKey come ONLY from the verified
+// envelope (req.serviceRequest), never from the request body directly. The
+// HMAC signature binds this exact clientId, so a leaked shared x-api-key
+// alone can no longer be used to act on an arbitrary client through this
+// route — see middleware/serviceRequest.js and POST /ask above for the
+// established pattern this mirrors.
+// Payload (req.servicePayload): { sourceFileId, fileName, mimeType, storagePath, sourceProvider? }
 // ---------------------------------------------------------------------------
 
-router.post('/ingest', async (req, res, next) => {
+router.post('/ingest', requireServiceRequest, async (req, res, next) => {
   try {
+    const { clientId } = req.serviceRequest;
     const {
-      clientId, sourceFileId, fileName, mimeType,
+      sourceFileId, fileName, mimeType,
       sourceProvider = 'portal_upload',
       storagePath,
-    } = req.body;
+    } = req.servicePayload || {};
 
-    if (!clientId || !sourceFileId || !fileName || !mimeType) {
-      return res.status(400).json({ error: 'clientId, sourceFileId, fileName, and mimeType are required' });
+    if (!sourceFileId || !fileName || !mimeType) {
+      return res.status(400).json({ error: 'sourceFileId, fileName, and mimeType are required' });
     }
     if (sourceProvider !== 'portal_upload') {
       return res.status(400).json({ error: 'Unsupported sourceProvider. This backend currently supports portal_upload only.' });
@@ -88,22 +96,23 @@ router.post('/ingest', async (req, res, next) => {
 // ---------------------------------------------------------------------------
 // POST /api/knowledge/reindex
 // Force re-ingest a document regardless of content hash.
-// Body: { clientId, sourceFileId, fileName, mimeType, storagePath, sourceProvider? }
+// Backlog H4 — see the note on POST /ingest above; same pattern.
+// Payload (req.servicePayload): { sourceFileId, fileName, mimeType, storagePath, sourceProvider? }
 // ---------------------------------------------------------------------------
 
-router.post('/reindex', async (req, res, next) => {
+router.post('/reindex', requireServiceRequest, async (req, res, next) => {
   try {
+    const { clientId } = req.serviceRequest;
     const {
-      clientId,
       sourceFileId,
       sourceProvider = 'portal_upload',
       fileName,
       mimeType,
       storagePath,
-    } = req.body;
+    } = req.servicePayload || {};
 
-    if (!clientId || !sourceFileId) {
-      return res.status(400).json({ error: 'clientId and sourceFileId are required' });
+    if (!sourceFileId) {
+      return res.status(400).json({ error: 'sourceFileId is required' });
     }
     if (sourceProvider !== 'portal_upload') {
       return res.status(400).json({ error: 'Unsupported sourceProvider. This backend currently supports portal_upload only.' });
@@ -130,20 +139,19 @@ router.post('/reindex', async (req, res, next) => {
 // ---------------------------------------------------------------------------
 // DELETE /api/knowledge/document/:id
 // Mark a document as deleted and remove its chunks.
-// Body or query: { clientId, sourceFileId?, sourceProvider? }
+// Backlog H4 — see the note on POST /ingest above; same pattern.
 // :id can be either the DB document UUID or 'by-source' for source-based lookup
+// Payload (req.servicePayload): { sourceFileId?, sourceProvider? }
 // ---------------------------------------------------------------------------
 
-router.delete('/document/:id', async (req, res, next) => {
+router.delete('/document/:id', requireServiceRequest, async (req, res, next) => {
   try {
+    const { clientId } = req.serviceRequest;
     const documentId = req.params.id !== 'by-source' ? req.params.id : undefined;
-    const { clientId, sourceFileId, sourceProvider = 'portal_upload' } = req.body || {};
+    const { sourceFileId, sourceProvider = 'portal_upload' } = req.servicePayload || {};
 
-    if (!clientId) {
-      return res.status(400).json({ error: 'clientId is required' });
-    }
     if (!documentId && !sourceFileId) {
-      return res.status(400).json({ error: 'Provide either a document UUID as :id or sourceFileId in the body' });
+      return res.status(400).json({ error: 'Provide either a document UUID as :id or sourceFileId in the payload' });
     }
     if (sourceProvider !== 'portal_upload') {
       return res.status(400).json({ error: 'Unsupported sourceProvider. This backend currently supports portal_upload only.' });
@@ -174,16 +182,22 @@ router.delete('/document/:id', async (req, res, next) => {
 // documents, chunks, chat history, gaps, ingestion jobs). Called by
 // Relativity's client-deletion flow BEFORE the Global client row is removed.
 // Deliberately does NOT call requireActiveClient — this endpoint must work
-// even after the Global client record is gone. Protection is inherited from
-// the router-level requireApiKey gate above (line 36), same as every other
-// route in this file — do not add requireActiveClient here.
+// even after the Global client record is gone.
+// Backlog H4: requireServiceRequest added — unlike requireActiveClient, it
+// never touches the database (pure HMAC check), so it stays compatible with
+// working after the Global client record is gone. clientId is trusted ONLY
+// from the verified envelope (req.serviceRequest), never the URL param; the
+// param is kept for REST addressability/logging and cross-checked below.
 // ---------------------------------------------------------------------------
 
-router.delete('/client/:clientId', async (req, res, next) => {
+router.delete('/client/:clientId', requireServiceRequest, async (req, res, next) => {
   try {
-    const { clientId } = req.params;
+    const { clientId } = req.serviceRequest;
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clientId)) {
       return res.status(400).json({ error: 'clientId must be a valid UUID' });
+    }
+    if (req.params.clientId !== clientId) {
+      return res.status(400).json({ error: 'URL clientId does not match the signed envelope.' });
     }
     const summary = await supabaseService.deleteAllClientData(clientId);
     res.json({ success: summary.errors.length === 0, clientId, ...summary });
@@ -195,12 +209,23 @@ router.delete('/client/:clientId', async (req, res, next) => {
 // ---------------------------------------------------------------------------
 // GET /api/knowledge/documents/:clientId
 // List all indexed documents for a client.
+// Backlog H4 — see the note on POST /ingest above; same pattern, applied to
+// a GET route. The signed envelope is sent as a JSON body on this GET
+// request (unusual but valid HTTP — express.json() parses req.body
+// regardless of verb, and this is a direct server-to-server axios call, not
+// routed through any cache/proxy that would strip it). clientId is trusted
+// ONLY from req.serviceRequest; the URL param is kept for REST
+// addressability/logging and cross-checked below.
 // ---------------------------------------------------------------------------
 
-router.get('/documents/:clientId', async (req, res, next) => {
+router.get('/documents/:clientId', requireServiceRequest, async (req, res, next) => {
   try {
-    await supabaseService.requireActiveClient(req.params.clientId);
-    const docs = await supabaseService.getDocumentsByClient(req.params.clientId);
+    const { clientId } = req.serviceRequest;
+    if (req.params.clientId !== clientId) {
+      return res.status(400).json({ error: 'URL clientId does not match the signed envelope.' });
+    }
+    await supabaseService.requireActiveClient(clientId);
+    const docs = await supabaseService.getDocumentsByClient(clientId);
     res.json({ documents: docs });
   } catch (err) {
     next(err);
@@ -210,16 +235,19 @@ router.get('/documents/:clientId', async (req, res, next) => {
 // ---------------------------------------------------------------------------
 // Knowledge collections (Milestone 5)
 //
-// Organization-wide (client_id-scoped), not member-scoped — same trust
-// pattern as the document routes above: gated only by the router-level
-// requireApiKey, since Relativity is the trusted server-to-server caller
-// and enforces owner/admin-only access itself before calling these.
+// Organization-wide (client_id-scoped), not member-scoped. Backlog H4:
+// requireServiceRequest added to every route below — see the note on
+// POST /ingest above for the pattern (and on GET /documents/:clientId for
+// the GET-with-signed-body variant used by the one GET route here).
 // ---------------------------------------------------------------------------
 
 // GET /api/knowledge/collections/:clientId
-router.get('/collections/:clientId', async (req, res, next) => {
+router.get('/collections/:clientId', requireServiceRequest, async (req, res, next) => {
   try {
-    const { clientId } = req.params;
+    const { clientId } = req.serviceRequest;
+    if (req.params.clientId !== clientId) {
+      return res.status(400).json({ error: 'URL clientId does not match the signed envelope.' });
+    }
     await supabaseService.requireActiveClient(clientId);
     const collections = await supabaseService.listCollectionsWithCounts(clientId);
     res.json({ collections });
@@ -229,13 +257,14 @@ router.get('/collections/:clientId', async (req, res, next) => {
 });
 
 // POST /api/knowledge/collections
-// Body: { clientId, name }
-router.post('/collections', async (req, res, next) => {
+// Payload (req.servicePayload): { name }
+router.post('/collections', requireServiceRequest, async (req, res, next) => {
   try {
-    const { clientId, name } = req.body;
+    const { clientId } = req.serviceRequest;
+    const { name } = req.servicePayload || {};
     const trimmed = typeof name === 'string' ? name.trim() : '';
-    if (!clientId || !trimmed) {
-      return res.status(400).json({ error: 'clientId and name are required' });
+    if (!trimmed) {
+      return res.status(400).json({ error: 'name is required' });
     }
     if (trimmed.length > 100) {
       return res.status(400).json({ error: 'name must be 100 characters or fewer' });
@@ -252,13 +281,14 @@ router.post('/collections', async (req, res, next) => {
 });
 
 // PATCH /api/knowledge/collections/:id
-// Body: { clientId, name }
-router.patch('/collections/:id', async (req, res, next) => {
+// Payload (req.servicePayload): { name }
+router.patch('/collections/:id', requireServiceRequest, async (req, res, next) => {
   try {
-    const { clientId, name } = req.body;
+    const { clientId } = req.serviceRequest;
+    const { name } = req.servicePayload || {};
     const trimmed = typeof name === 'string' ? name.trim() : '';
-    if (!clientId || !trimmed) {
-      return res.status(400).json({ error: 'clientId and name are required' });
+    if (!trimmed) {
+      return res.status(400).json({ error: 'name is required' });
     }
     if (trimmed.length > 100) {
       return res.status(400).json({ error: 'name must be 100 characters or fewer' });
@@ -280,14 +310,12 @@ router.patch('/collections/:id', async (req, res, next) => {
 });
 
 // DELETE /api/knowledge/collections/:id
-// Body: { clientId }
 // Refuses to delete the default ("General") collection, and refuses to
 // delete a non-empty collection (defense in depth: the FK is also
 // ON DELETE RESTRICT at the DB level — see migrations/006).
-router.delete('/collections/:id', async (req, res, next) => {
+router.delete('/collections/:id', requireServiceRequest, async (req, res, next) => {
   try {
-    const { clientId } = req.body || {};
-    if (!clientId) return res.status(400).json({ error: 'clientId is required' });
+    const { clientId } = req.serviceRequest;
     await supabaseService.requireActiveClient(clientId);
 
     const collection = await supabaseService.getCollectionById(req.params.id);
@@ -316,20 +344,22 @@ router.delete('/collections/:id', async (req, res, next) => {
 // ---------------------------------------------------------------------------
 // PATCH /api/knowledge/document/:id/collection
 // Move a document to a different collection.
+// Backlog H4 — see the note on POST /ingest above; same pattern.
 // :id can be either the DB document UUID or 'by-source' for source-based lookup.
-// Body: { clientId, collectionId, sourceFileId?, sourceProvider? }
+// Payload (req.servicePayload): { collectionId, sourceFileId?, sourceProvider? }
 // ---------------------------------------------------------------------------
 
-router.patch('/document/:id/collection', async (req, res, next) => {
+router.patch('/document/:id/collection', requireServiceRequest, async (req, res, next) => {
   try {
+    const { clientId } = req.serviceRequest;
     const documentId = req.params.id !== 'by-source' ? req.params.id : undefined;
-    const { clientId, collectionId, sourceFileId, sourceProvider = 'portal_upload' } = req.body || {};
+    const { collectionId, sourceFileId, sourceProvider = 'portal_upload' } = req.servicePayload || {};
 
-    if (!clientId || !collectionId) {
-      return res.status(400).json({ error: 'clientId and collectionId are required' });
+    if (!collectionId) {
+      return res.status(400).json({ error: 'collectionId is required' });
     }
     if (!documentId && !sourceFileId) {
-      return res.status(400).json({ error: 'Provide either a document UUID as :id or sourceFileId in the body' });
+      return res.status(400).json({ error: 'Provide either a document UUID as :id or sourceFileId in the payload' });
     }
 
     await supabaseService.requireActiveClient(clientId);
