@@ -1001,27 +1001,6 @@ async function deleteStorageForClient(clientId) {
   return { removed, errors };
 }
 
-// Best-effort: no migration in this repo defines a bare `documents` table
-// (only `knowledge_documents`), but a legacy table may still exist live in
-// the DB from before this repo's history. Must never throw — swallow
-// "table/column doesn't exist" errors so cleanup keeps going regardless.
-async function deleteLegacyDocumentsForClient(clientId) {
-  try {
-    const { error, count } = await aikbSupabase
-      .from('documents')
-      .delete({ count: 'exact' })
-      .or(`metadata->>clientId.eq.${clientId},metadata->>client_id.eq.${clientId}`);
-    if (error) {
-      console.warn(`[deleteLegacyDocumentsForClient] ${error.message}`);
-      return { attempted: true, deleted: 0, error: error.message };
-    }
-    return { attempted: true, deleted: count ?? 0 };
-  } catch (err) {
-    console.warn(`[deleteLegacyDocumentsForClient] ${err.message}`);
-    return { attempted: true, deleted: 0, error: err.message };
-  }
-}
-
 async function deleteAllClientData(clientId) {
   console.log(`[deleteAllClientData] START | clientId=${clientId}`);
   const errors = [];
@@ -1057,11 +1036,8 @@ async function deleteAllClientData(clientId) {
     }
   }
 
-  const legacyDocuments = await deleteLegacyDocumentsForClient(clientId);
-  if (legacyDocuments.error) errors.push(`legacyDocuments: ${legacyDocuments.error}`);
-
   console.log(`[deleteAllClientData] DONE | clientId=${clientId} | errors=${errors.length}`);
-  return { storage, tables: tableResults, legacyDocuments, errors };
+  return { storage, tables: tableResults, errors };
 }
 
 module.exports = {
