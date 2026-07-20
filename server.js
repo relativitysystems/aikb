@@ -7,8 +7,13 @@ const { inngest } = require('./inngest/client');
 const { functions } = require('./inngest/functions');
 const knowledgeRoutes = require('./routes/knowledge');
 const slackRoutes = require('./routes/slack');
+const corsPolicy = require('./middleware/corsPolicy');
+const { knowledgeApiLimiter } = require('./middleware/rateLimit');
 
 const app = express();
+
+// Backlog M6 — explicit CORS policy, ahead of every route.
+app.use(corsPolicy);
 
 app.use(express.json());
 
@@ -17,7 +22,8 @@ app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'relativity-
 // Inngest serve endpoint — must come before other routes
 app.use('/api/inngest', serve({ client: inngest, functions }));
 
-app.use('/api/knowledge', knowledgeRoutes);
+// Backlog M6 — general-purpose rate limiting on every x-api-key-gated route.
+app.use('/api/knowledge', knowledgeApiLimiter, knowledgeRoutes);
 app.use('/api/slack', slackRoutes);
 
 app.use((err, _req, res, _next) => {
