@@ -81,15 +81,45 @@ async function logIngestionError(jobId, documentId, err) {
   if (error) console.error('logIngestionError: failed to write error to DB:', error.message);
 }
 
-async function getIngestionJobsByClient(clientId) {
+// Shared building blocks for the client stats/health endpoints below
+// (getIngestionJobsByClient, getClientSummaryData, getClientAnalyticsData,
+// getClientKnowledgeStats) — several of these previously re-issued the exact
+// same query independently. Centralizing them here means a caller that needs
+// more than one of these (see getClientKnowledgeStats) only pays for each
+// underlying table once.
+async function fetchRecentIngestionJobs(clientId, limit = 100) {
   const { data, error } = await aikbSupabase
     .from('knowledge_ingestion_jobs')
     .select('id, client_id, source_file_id, status, error_message, document_id, created_at, updated_at')
     .eq('client_id', clientId)
     .order('created_at', { ascending: false })
-    .limit(100);
-  if (error) throw new Error(`getIngestionJobsByClient: ${error.message}`);
+    .limit(limit);
+  if (error) throw new Error(`fetchRecentIngestionJobs: ${error.message}`);
   return data;
+}
+
+async function fetchUserQuestionTimestamps(clientId) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_chat_messages')
+    .select('created_at')
+    .eq('client_id', clientId)
+    .eq('role', 'user')
+    .is('deleted_at', null);
+  if (error) throw new Error(`fetchUserQuestionTimestamps: ${error.message}`);
+  return data;
+}
+
+async function fetchKnowledgeGapsCount(clientId) {
+  const { count, error } = await aikbSupabase
+    .from('knowledge_gaps')
+    .select('*', { count: 'exact', head: true })
+    .eq('client_id', clientId);
+  if (error) throw new Error(`fetchKnowledgeGapsCount: ${error.message}`);
+  return count ?? 0;
+}
+
+async function getIngestionJobsByClient(clientId) {
+  return fetchRecentIngestionJobs(clientId, 100);
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +189,7 @@ async function getDocumentsByClient(clientId) {
 }
 
 async function getClientSummaryData(clientId) {
-  const [docsRes, chunksRes, jobsRes, msgsRes, gapsRes] = await Promise.all([
+  const [docsRes, chunksRes, jobs, msgs, gapsCount] = await Promise.all([
     aikbSupabase
       .from('knowledge_documents')
       .select('status, last_indexed_at')
@@ -168,29 +198,13 @@ async function getClientSummaryData(clientId) {
       .from('knowledge_chunks')
       .select('*', { count: 'exact', head: true })
       .eq('client_id', clientId),
-    aikbSupabase
-      .from('knowledge_ingestion_jobs')
-      .select('id, source_file_id, status, error_message, document_id, created_at, updated_at')
-      .eq('client_id', clientId)
-      .order('created_at', { ascending: false })
-      .limit(100),
-    aikbSupabase
-      .from('knowledge_chat_messages')
-      .select('created_at')
-      .eq('client_id', clientId)
-      .eq('role', 'user')
-      .is('deleted_at', null),
-    aikbSupabase
-      .from('knowledge_gaps')
-      .select('*', { count: 'exact', head: true })
-      .eq('client_id', clientId),
+    fetchRecentIngestionJobs(clientId, 100),
+    fetchUserQuestionTimestamps(clientId),
+    fetchKnowledgeGapsCount(clientId),
   ]);
 
   if (docsRes.error) throw new Error(`getClientSummaryData (docs): ${docsRes.error.message}`);
   if (chunksRes.error) throw new Error(`getClientSummaryData (chunks): ${chunksRes.error.message}`);
-  if (jobsRes.error) throw new Error(`getClientSummaryData (jobs): ${jobsRes.error.message}`);
-  if (msgsRes.error) throw new Error(`getClientSummaryData (msgs): ${msgsRes.error.message}`);
-  if (gapsRes.error) throw new Error(`getClientSummaryData (gaps): ${gapsRes.error.message}`);
 
   const docs = docsRes.data;
   const byStatus = (s) => docs.filter((d) => d.status === s).length;
@@ -198,8 +212,6 @@ async function getClientSummaryData(clientId) {
     .filter((d) => d.status === 'indexed' && d.last_indexed_at)
     .map((d) => d.last_indexed_at);
 
-  const jobs = jobsRes.data;
-  const msgs = msgsRes.data;
   const msgDates = msgs.map((m) => m.created_at);
 
   return {
@@ -212,24 +224,16 @@ async function getClientSummaryData(clientId) {
     latestIngestionJob: jobs[0] ?? null,
     failedJobsCount: jobs.filter((j) => j.status === 'failed').length,
     totalQuestions: msgs.length,
-    totalKnowledgeGaps: gapsRes.count ?? 0,
+    totalKnowledgeGaps: gapsCount,
     lastQuestionAt: msgDates.length ? msgDates.reduce((a, b) => (a > b ? a : b)) : null,
     lastIndexedAt: indexedDates.length ? indexedDates.reduce((a, b) => (a > b ? a : b)) : null,
   };
 }
 
 async function getClientAnalyticsData(clientId) {
-  const [msgsRes, gapsRes, recentGapsRes, failedJobsRes, recentJobsRes] = await Promise.all([
-    aikbSupabase
-      .from('knowledge_chat_messages')
-      .select('*', { count: 'exact', head: true })
-      .eq('client_id', clientId)
-      .eq('role', 'user')
-      .is('deleted_at', null),
-    aikbSupabase
-      .from('knowledge_gaps')
-      .select('*', { count: 'exact', head: true })
-      .eq('client_id', clientId),
+  const [msgs, gapsCount, recentGapsRes, failedJobsRes, jobs] = await Promise.all([
+    fetchUserQuestionTimestamps(clientId),
+    fetchKnowledgeGapsCount(clientId),
     aikbSupabase
       .from('knowledge_gaps')
       .select('id, question, reason, status, created_at')
@@ -243,26 +247,104 @@ async function getClientAnalyticsData(clientId) {
       .eq('status', 'failed')
       .order('created_at', { ascending: false })
       .limit(10),
+    fetchRecentIngestionJobs(clientId, 100),
+  ]);
+
+  if (recentGapsRes.error) throw new Error(`getClientAnalyticsData (recent gaps): ${recentGapsRes.error.message}`);
+  if (failedJobsRes.error) throw new Error(`getClientAnalyticsData (failed jobs): ${failedJobsRes.error.message}`);
+
+  return {
+    totalQuestions: msgs.length,
+    totalKnowledgeGaps: gapsCount,
+    recentKnowledgeGaps: recentGapsRes.data ?? [],
+    failedIngestionJobs: failedJobsRes.data ?? [],
+    // Top 10 of the same 100-row window fetched above — behaviorally
+    // identical to a direct "ORDER BY created_at DESC LIMIT 10" query since
+    // 10 <= 100, just without a second round trip. Projected down to this
+    // endpoint's original (narrower) column set.
+    recentIngestionActivity: jobs
+      .slice(0, 10)
+      .map(({ id, source_file_id, status, created_at, updated_at }) => ({
+        id,
+        source_file_id,
+        status,
+        created_at,
+        updated_at,
+      })),
+  };
+}
+
+// Combined view used by callers that previously fetched /summary, /analytics,
+// and /jobs back-to-back for the same client (backlog L5) — e.g. Relativity's
+// admin dashboard, which fired all three in parallel for every client on
+// every page load. Each underlying table is queried exactly once here,
+// instead of knowledge_ingestion_jobs up to 4x, knowledge_chat_messages 2x,
+// and knowledge_gaps 2x across three separate HTTP round trips.
+async function getClientKnowledgeStats(clientId) {
+  const [docsRes, chunksRes, jobs, msgs, gapsCount, recentGapsRes, failedJobsRes] = await Promise.all([
+    aikbSupabase
+      .from('knowledge_documents')
+      .select('status, last_indexed_at')
+      .eq('client_id', clientId),
+    aikbSupabase
+      .from('knowledge_chunks')
+      .select('*', { count: 'exact', head: true })
+      .eq('client_id', clientId),
+    fetchRecentIngestionJobs(clientId, 100),
+    fetchUserQuestionTimestamps(clientId),
+    fetchKnowledgeGapsCount(clientId),
+    aikbSupabase
+      .from('knowledge_gaps')
+      .select('id, question, reason, status, created_at')
+      .eq('client_id', clientId)
+      .order('created_at', { ascending: false })
+      .limit(10),
     aikbSupabase
       .from('knowledge_ingestion_jobs')
-      .select('id, source_file_id, status, created_at, updated_at')
+      .select('id, source_file_id, status, error_message, created_at, updated_at')
       .eq('client_id', clientId)
+      .eq('status', 'failed')
       .order('created_at', { ascending: false })
       .limit(10),
   ]);
 
-  if (msgsRes.error) throw new Error(`getClientAnalyticsData (msgs): ${msgsRes.error.message}`);
-  if (gapsRes.error) throw new Error(`getClientAnalyticsData (gaps): ${gapsRes.error.message}`);
-  if (recentGapsRes.error) throw new Error(`getClientAnalyticsData (recent gaps): ${recentGapsRes.error.message}`);
-  if (failedJobsRes.error) throw new Error(`getClientAnalyticsData (failed jobs): ${failedJobsRes.error.message}`);
-  if (recentJobsRes.error) throw new Error(`getClientAnalyticsData (recent jobs): ${recentJobsRes.error.message}`);
+  if (docsRes.error) throw new Error(`getClientKnowledgeStats (docs): ${docsRes.error.message}`);
+  if (chunksRes.error) throw new Error(`getClientKnowledgeStats (chunks): ${chunksRes.error.message}`);
+  if (recentGapsRes.error) throw new Error(`getClientKnowledgeStats (recent gaps): ${recentGapsRes.error.message}`);
+  if (failedJobsRes.error) throw new Error(`getClientKnowledgeStats (failed jobs): ${failedJobsRes.error.message}`);
+
+  const docs = docsRes.data;
+  const byStatus = (s) => docs.filter((d) => d.status === s).length;
+  const indexedDates = docs
+    .filter((d) => d.status === 'indexed' && d.last_indexed_at)
+    .map((d) => d.last_indexed_at);
+  const msgDates = msgs.map((m) => m.created_at);
 
   return {
-    totalQuestions: msgsRes.count ?? 0,
-    totalKnowledgeGaps: gapsRes.count ?? 0,
+    totalDocuments: docs.filter((d) => d.status !== 'deleted').length,
+    indexedDocuments: byStatus('indexed'),
+    failedDocuments: byStatus('error') + byStatus('failed'),
+    indexingDocuments: byStatus('indexing') + byStatus('pending'),
+    deletedDocuments: byStatus('deleted'),
+    totalChunks: chunksRes.count ?? 0,
+    latestIngestionJob: jobs[0] ?? null,
+    failedJobsCount: jobs.filter((j) => j.status === 'failed').length,
+    totalQuestions: msgs.length,
+    totalKnowledgeGaps: gapsCount,
+    lastQuestionAt: msgDates.length ? msgDates.reduce((a, b) => (a > b ? a : b)) : null,
+    lastIndexedAt: indexedDates.length ? indexedDates.reduce((a, b) => (a > b ? a : b)) : null,
     recentKnowledgeGaps: recentGapsRes.data ?? [],
     failedIngestionJobs: failedJobsRes.data ?? [],
-    recentIngestionActivity: recentJobsRes.data ?? [],
+    recentIngestionActivity: jobs
+      .slice(0, 10)
+      .map(({ id, source_file_id, status, created_at, updated_at }) => ({
+        id,
+        source_file_id,
+        status,
+        created_at,
+        updated_at,
+      })),
+    ingestionJobs: jobs,
   };
 }
 
@@ -1090,5 +1172,6 @@ module.exports = {
   getIndexedDocumentByContentHash,
   getClientSummaryData,
   getClientAnalyticsData,
+  getClientKnowledgeStats,
   deleteAllClientData,
 };

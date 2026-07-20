@@ -399,6 +399,29 @@ router.get('/analytics/:clientId', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/knowledge/stats/:clientId
+//
+// Superset of /summary + /analytics + /jobs for a single client — backlog
+// L5. Added for callers (e.g. Relativity's admin dashboard) that previously
+// fetched all three separately for the same client on every request; each
+// underlying table is queried exactly once here instead of up to 4x across
+// three round trips. /summary, /analytics, and /jobs are unchanged and still
+// used independently elsewhere (e.g. the client portal calls /analytics
+// alone), so this is additive, not a replacement.
+// ---------------------------------------------------------------------------
+
+router.get('/stats/:clientId', async (req, res, next) => {
+  try {
+    const { clientId } = req.params;
+    await supabaseService.requireActiveClient(clientId);
+    const stats = await supabaseService.getClientKnowledgeStats(clientId);
+    res.json(stats);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/knowledge/query
 // Synchronous RAG query: vector search + LLM answer.
 // Body: { clientId, question, sessionId? }
