@@ -384,12 +384,18 @@ router.patch('/document/:id/collection', requireServiceRequest, async (req, res,
 // ---------------------------------------------------------------------------
 // GET /api/knowledge/jobs/:clientId
 // List recent ingestion jobs for a client.
+// Backlog H4 (residual scope): requireServiceRequest added — see the note on
+// GET /documents/:clientId above for the GET-with-signed-body pattern.
 // ---------------------------------------------------------------------------
 
-router.get('/jobs/:clientId', async (req, res, next) => {
+router.get('/jobs/:clientId', requireServiceRequest, async (req, res, next) => {
   try {
-    await supabaseService.requireActiveClient(req.params.clientId);
-    const jobs = await supabaseService.getIngestionJobsByClient(req.params.clientId);
+    const { clientId } = req.serviceRequest;
+    if (req.params.clientId !== clientId) {
+      return res.status(400).json({ error: 'URL clientId does not match the signed envelope.' });
+    }
+    await supabaseService.requireActiveClient(clientId);
+    const jobs = await supabaseService.getIngestionJobsByClient(clientId);
     res.json({ jobs: jobs.map((j) => ({ ...j, error_message: sanitizeJobError(j.error_message) })) });
   } catch (err) {
     next(err);
@@ -399,11 +405,16 @@ router.get('/jobs/:clientId', async (req, res, next) => {
 // ---------------------------------------------------------------------------
 // GET /api/knowledge/summary/:clientId
 // Returns aggregated document, chunk, job, and chat statistics for a client.
+// Backlog H4 (residual scope): requireServiceRequest added — see the note on
+// GET /documents/:clientId above for the GET-with-signed-body pattern.
 // ---------------------------------------------------------------------------
 
-router.get('/summary/:clientId', async (req, res, next) => {
+router.get('/summary/:clientId', requireServiceRequest, async (req, res, next) => {
   try {
-    const { clientId } = req.params;
+    const { clientId } = req.serviceRequest;
+    if (req.params.clientId !== clientId) {
+      return res.status(400).json({ error: 'URL clientId does not match the signed envelope.' });
+    }
     await supabaseService.requireActiveClient(clientId);
     const summary = await supabaseService.getClientSummaryData(clientId);
     res.json(summary);
@@ -415,11 +426,16 @@ router.get('/summary/:clientId', async (req, res, next) => {
 // ---------------------------------------------------------------------------
 // GET /api/knowledge/analytics/:clientId
 // Returns question counts, knowledge gaps, and ingestion activity for a client.
+// Backlog H4 (residual scope): requireServiceRequest added — see the note on
+// GET /documents/:clientId above for the GET-with-signed-body pattern.
 // ---------------------------------------------------------------------------
 
-router.get('/analytics/:clientId', async (req, res, next) => {
+router.get('/analytics/:clientId', requireServiceRequest, async (req, res, next) => {
   try {
-    const { clientId } = req.params;
+    const { clientId } = req.serviceRequest;
+    if (req.params.clientId !== clientId) {
+      return res.status(400).json({ error: 'URL clientId does not match the signed envelope.' });
+    }
     await supabaseService.requireActiveClient(clientId);
     const analytics = await supabaseService.getClientAnalyticsData(clientId);
     res.json(analytics);
@@ -438,11 +454,16 @@ router.get('/analytics/:clientId', async (req, res, next) => {
 // three round trips. /summary, /analytics, and /jobs are unchanged and still
 // used independently elsewhere (e.g. the client portal calls /analytics
 // alone), so this is additive, not a replacement.
+// Backlog H4 (residual scope): requireServiceRequest added — see the note on
+// GET /documents/:clientId above for the GET-with-signed-body pattern.
 // ---------------------------------------------------------------------------
 
-router.get('/stats/:clientId', async (req, res, next) => {
+router.get('/stats/:clientId', requireServiceRequest, async (req, res, next) => {
   try {
-    const { clientId } = req.params;
+    const { clientId } = req.serviceRequest;
+    if (req.params.clientId !== clientId) {
+      return res.status(400).json({ error: 'URL clientId does not match the signed envelope.' });
+    }
     await supabaseService.requireActiveClient(clientId);
     const stats = await supabaseService.getClientKnowledgeStats(clientId);
     res.json(stats);
