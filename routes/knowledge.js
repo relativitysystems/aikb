@@ -544,10 +544,21 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
 // already-extracted question, and narrow origin metadata (§4.9).
 // ---------------------------------------------------------------------------
 
+// Backlog M13: caller-supplied, but allowlisted rather than trusted as-is —
+// 'slack_dm' (vs the pre-existing 'slack' for channel @mentions) tags the
+// resulting session so it can be excluded from portal-facing chat history
+// (see supabaseService.js#listChatSessions / #getChatSession). Anything
+// unexpected safely falls back to 'slack'. Exported (unlike this file's
+// other route logic) so it has direct unit coverage without requiring a
+// real Inngest send — mirrors runKnowledgeQuery.js's exported pure helpers.
+function resolveAskOrigin(origin) {
+  return ['slack', 'slack_dm'].includes(origin) ? origin : 'slack';
+}
+
 router.post('/ask', requireServiceRequest, async (req, res, next) => {
   try {
     const { clientId, idempotencyKey } = req.serviceRequest;
-    const { question, originMetadata, allowedCollectionIds } = req.servicePayload || {};
+    const { question, originMetadata, allowedCollectionIds, origin } = req.servicePayload || {};
 
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'question is required' });
@@ -555,12 +566,15 @@ router.post('/ask', requireServiceRequest, async (req, res, next) => {
 
     await supabaseService.requireActiveClient(clientId);
 
+    const safeOrigin = resolveAskOrigin(origin);
+
     const event = await inngest.send({
       name: 'knowledge/slack.question.requested',
       data: {
         clientId,
         question,
         idempotencyKey,
+        origin: safeOrigin,
         originMetadata: originMetadata && typeof originMetadata === 'object' ? originMetadata : null,
         // Fail-closed: anything other than an explicit array (missing,
         // malformed, wrong type) is treated as "zero allowed collections",
@@ -796,3 +810,4 @@ router.patch('/gaps/:id', requireServiceRequest, async (req, res, next) => {
 });
 
 module.exports = router;
+module.exports.resolveAskOrigin = resolveAskOrigin;

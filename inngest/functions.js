@@ -454,7 +454,7 @@ const slackQuestionRequested = inngest.createFunction(
   },
   { event: 'knowledge/slack.question.requested' },
   async ({ event, step }) => {
-    const { clientId, question, idempotencyKey, originMetadata, allowedCollectionIds } = event.data;
+    const { clientId, question, idempotencyKey, origin, originMetadata, allowedCollectionIds } = event.data;
 
     if (!clientId) throw new Error('clientId is required');
     if (!question) throw new Error('question is required');
@@ -464,7 +464,10 @@ const slackQuestionRequested = inngest.createFunction(
       return runKnowledgeQuery({
         clientId,
         question,
-        origin: 'slack',
+        // Backlog M13: origin now flows from the /ask request itself
+        // (routes/knowledge.js already allowlists it) — default here only
+        // covers events enqueued before this field existed.
+        origin: origin || 'slack',
         originMetadata,
         idempotencyKey,
         // Fail-closed: always an explicit array by the time /ask enqueued

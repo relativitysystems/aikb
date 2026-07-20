@@ -800,7 +800,17 @@ async function getChatSession(clientId, sessionId, memberId = null, isAdmin = fa
     .select('*')
     .eq('id', sessionId)
     .eq('client_id', clientId)
-    .is('deleted_at', null);
+    .is('deleted_at', null)
+    // Backlog M13: DM conversations must never be exposed through any
+    // portal-accessible path (this function backs every portal session
+    // route — messages, delete, rename, and resume-by-id). AIKB's own
+    // internal pipeline (dedup replay, redaction) never calls this
+    // function, so it's unaffected — see getChatSessionByIdempotencyKey /
+    // redactChatSessionByIdempotencyKey below. Explicitly re-includes
+    // origin IS NULL: plain .neq('origin', 'slack_dm') would silently drop
+    // every session predating the origin column (SQL NULL <> 'x' is NULL,
+    // not true), which would otherwise hide all pre-Milestone-4 history.
+    .or('origin.is.null,origin.neq.slack_dm');
 
   if (memberId && !isAdmin) {
     query = query.eq('member_id', memberId);
@@ -819,6 +829,10 @@ async function listChatSessions(clientId, memberId = null, isAdmin = false) {
     .select('id, title, created_at, updated_at, member_id')
     .eq('client_id', clientId)
     .is('deleted_at', null)
+    // Backlog M13: DM conversations never appear in portal chat history.
+    // .or(...) (not .neq) so origin IS NULL (every pre-Milestone-4 session)
+    // stays included — see getChatSession's identical fix above.
+    .or('origin.is.null,origin.neq.slack_dm')
     .order('created_at', { ascending: false });
 
   if (memberId && !isAdmin) {

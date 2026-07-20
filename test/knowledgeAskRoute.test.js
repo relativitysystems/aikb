@@ -23,6 +23,7 @@ const assert = require('node:assert/strict');
 const express = require('express');
 
 const knowledgeRoutes = require('../routes/knowledge');
+const { resolveAskOrigin } = knowledgeRoutes;
 const { signServiceRequest } = require('../services/serviceRequestAuth');
 
 const CLIENT_ID = '11111111-1111-1111-1111-111111111111';
@@ -85,5 +86,19 @@ test('POST /api/knowledge/ask — auth gating and validation', async (t) => {
     });
     assert.equal(res.status, 401);
   });
+});
+
+// Backlog M13: resolveAskOrigin is the allowlist gate deciding whether an
+// AIKB session ends up excluded from portal chat history (origin:
+// 'slack_dm') or not — unit tested directly (not via a real /ask HTTP
+// call, which would require a live Inngest send, out of scope for this
+// file's stated convention of never making a real Supabase/Inngest call).
+test('resolveAskOrigin — allowlists slack/slack_dm, defaults anything else to slack', () => {
+  assert.equal(resolveAskOrigin('slack'), 'slack');
+  assert.equal(resolveAskOrigin('slack_dm'), 'slack_dm');
+  assert.equal(resolveAskOrigin(undefined), 'slack', 'missing origin (pre-M13 callers) must default to slack');
+  assert.equal(resolveAskOrigin(null), 'slack');
+  assert.equal(resolveAskOrigin('portal'), 'slack', 'an unexpected/spoofed value must never pass through unvalidated');
+  assert.equal(resolveAskOrigin(''), 'slack');
 });
 
