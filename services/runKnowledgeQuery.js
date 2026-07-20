@@ -23,9 +23,22 @@
 // aikb/migrations/006_knowledge_collections.sql's match_knowledge_chunks —
 // so a restricted chunk is never fetched, and therefore never reaches the
 // LLM prompt built below.
+//
+// Backlog M4: as of this change, this function DOES auto-persist a
+// knowledge_gaps row (reportedBy: 'system') itself whenever it detects a
+// gap, for both origins — this is a deliberate reversal of the prior
+// "never auto-persists, only POST /api/knowledge/gaps does" invariant.
+// Dedup is via the idempotencyKey built by services/knowledgeGapKey.js
+// (client+question+ISO-week), not by this function refusing to try — see
+// supabaseService.js#createKnowledgeGap's upsert-on-conflict semantics.
+// This is best-effort: a failure here is logged and swallowed, never
+// thrown, since gap logging is review-workflow/analytics data, not core to
+// answering the user (unlike message persistence above, which is core to
+// session continuity and is allowed to throw).
 
 const defaultSupabaseService = require('./supabaseService');
 const defaultOpenaiService = require('./openaiService');
+const { buildGapIdempotencyKey } = require('./knowledgeGapKey');
 
 function isAdminRole(role) {
   return role === 'owner' || role === 'admin';
@@ -51,6 +64,26 @@ function normalizeGapAnswerSource(answer) {
     return answer.replace(/^Source\s*:\s*.*$/gim, 'Source: N/A');
   }
   return `${answer}\n\nSource: N/A`;
+}
+
+/**
+ * Best-effort auto-persist of a detected knowledge gap (Backlog M4). Never
+ * throws — a failure here must not break the user-facing answer/Slack
+ * reply, since this is review-workflow/analytics data, not the response
+ * itself.
+ */
+async function persistGapBestEffort({ supabaseService, clientId, sessionId, userMessageId, question, reason, memberId, origin, originMetadata }) {
+  try {
+    const idempotencyKey = buildGapIdempotencyKey({ clientId, question });
+    await supabaseService.createKnowledgeGap({
+      clientId, sessionId, messageId: userMessageId, question, reason, memberId,
+      origin, originMetadata, idempotencyKey, reportedBy: 'system',
+    });
+  } catch (err) {
+    console.error('[runKnowledgeQuery] createKnowledgeGap failed (best-effort, swallowed)', {
+      clientId, origin, reason, message: err.message,
+    });
+  }
 }
 
 /**
@@ -230,6 +263,10 @@ async function runKnowledgeQuery({
       metadata: { question, retrievalQuery, intent, retrievalSkipped: false, isKnowledgeGap: true, gapReason: 'no_chunks_found' },
       memberId,
     });
+    await persistGapBestEffort({
+      supabaseService, clientId, sessionId, userMessageId: userMsg.id, question,
+      reason: 'no_chunks_found', memberId, origin, originMetadata,
+    });
     return { answer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'no_chunks_found', userMessageId: userMsg.id, intent };
   }
 
@@ -272,6 +309,10 @@ async function runKnowledgeQuery({
       sources: [],
       metadata: { ...chunkMetadata, intent, retrievalSkipped: false, isKnowledgeGap: true, gapReason: 'answer_indicated_not_found' },
       memberId,
+    });
+    await persistGapBestEffort({
+      supabaseService, clientId, sessionId, userMessageId: userMsg.id, question,
+      reason: 'answer_indicated_not_found', memberId, origin, originMetadata,
     });
     return { answer: normalizedAnswer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'answer_indicated_not_found', userMessageId: userMsg.id, intent };
   }

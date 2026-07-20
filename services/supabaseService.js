@@ -1030,13 +1030,81 @@ async function getIndexedDocumentByContentHash(clientId, provider, contentHash, 
 // ---------------------------------------------------------------------------
 
 // member_id references Relativity_Global.client_members.id — plain UUID, no FK.
-async function createKnowledgeGap({ clientId, sessionId, messageId, question, reason, memberId = null }) {
-  const { data, error } = await aikbSupabase
+//
+// Backlog M4/M12: upsert on idempotencyKey (see services/knowledgeGapKey.js)
+// rather than a plain insert, so runKnowledgeQuery's auto-persist (origin:
+// 'system') and a user's manual POST /api/knowledge/gaps save (origin:
+// 'user') converge on one row per client+question+week instead of a
+// duplicate. On conflict, only reason/session_id/message_id/updated_at are
+// refreshed — status and reported_by are deliberately left untouched so a
+// recurring question never resets an admin's review state or misattributes
+// a system-detected gap to 'user' (or vice versa).
+async function createKnowledgeGap({
+  clientId, sessionId = null, messageId = null, question, reason,
+  memberId = null, origin = null, originMetadata = null,
+  idempotencyKey = null, reportedBy = 'system',
+}) {
+  const row = {
+    client_id: clientId, session_id: sessionId, message_id: messageId,
+    question, reason, member_id: memberId,
+    origin, origin_metadata: originMetadata,
+    idempotency_key: idempotencyKey, reported_by: reportedBy,
+  };
+
+  if (!idempotencyKey) {
+    const { data, error } = await aikbSupabase.from('knowledge_gaps').insert(row).select().single();
+    if (error) throw new Error(`createKnowledgeGap: ${error.message}`);
+    return data;
+  }
+
+  const { data: inserted, error: insertErr } = await aikbSupabase
     .from('knowledge_gaps')
-    .insert({ client_id: clientId, session_id: sessionId, message_id: messageId, question, reason, member_id: memberId })
+    .upsert(row, { onConflict: 'idempotency_key', ignoreDuplicates: true })
+    .select();
+  if (insertErr) throw new Error(`createKnowledgeGap: ${insertErr.message}`);
+  if (inserted && inserted.length) return inserted[0];
+
+  const { data: updated, error: updateErr } = await aikbSupabase
+    .from('knowledge_gaps')
+    .update({ reason, session_id: sessionId, message_id: messageId, updated_at: new Date().toISOString() })
+    .eq('idempotency_key', idempotencyKey)
     .select()
     .single();
-  if (error) throw new Error(`createKnowledgeGap: ${error.message}`);
+  if (updateErr) throw new Error(`createKnowledgeGap: ${updateErr.message}`);
+  return updated;
+}
+
+// Backlog M5: admin review workflow over knowledge_gaps.status
+// (open/reviewed/resolved/ignored — see migrations/003_chat_history.sql's
+// CHECK constraint). Mirrors listCollectionsWithCounts/getCollectionById's
+// shape for the equivalent per-client-list / by-id-lookup pair.
+async function listKnowledgeGapsByClient(clientId, { status = null } = {}) {
+  let query = aikbSupabase
+    .from('knowledge_gaps')
+    .select('*')
+    .eq('client_id', clientId)
+    .order('created_at', { ascending: false })
+    .limit(200);
+  if (status) query = query.eq('status', status);
+  const { data, error } = await query;
+  if (error) throw new Error(`listKnowledgeGapsByClient: ${error.message}`);
+  return data || [];
+}
+
+async function getKnowledgeGapById(id) {
+  const { data, error } = await aikbSupabase.from('knowledge_gaps').select('*').eq('id', id).maybeSingle();
+  if (error) throw new Error(`getKnowledgeGapById: ${error.message}`);
+  return data || null;
+}
+
+async function updateKnowledgeGapStatus(id, status) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_gaps')
+    .update({ status, updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .select()
+    .single();
+  if (error) throw new Error(`updateKnowledgeGapStatus: ${error.message}`);
   return data;
 }
 
@@ -1169,6 +1237,9 @@ module.exports = {
   listChatMessages,
   listRecentChatMessages,
   createKnowledgeGap,
+  listKnowledgeGapsByClient,
+  getKnowledgeGapById,
+  updateKnowledgeGapStatus,
   getIndexedDocumentByContentHash,
   getClientSummaryData,
   getClientAnalyticsData,

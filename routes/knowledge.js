@@ -8,6 +8,7 @@ const config = require('../config');
 const { requireMemberContext } = require('../middleware/resolveContext');
 const { requireServiceRequest } = require('../middleware/serviceRequest');
 const { runKnowledgeQuery, isAdminRole } = require('../services/runKnowledgeQuery');
+const { buildGapIdempotencyKey } = require('../services/knowledgeGapKey');
 
 const router = express.Router();
 
@@ -508,6 +509,10 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
       memberId,
       memberRole,
       origin: 'portal',
+      // Backlog M12: narrow, safe metadata only (never a token/secret) —
+      // the concrete context actually available at this call site, mirroring
+      // what Slack's ask flow already attaches (teamId/channelId/etc.).
+      originMetadata: { route: '/api/knowledge/query', memberRole: memberRole || null },
       // Omitted (undefined/null) => no restriction, searches every
       // collection — this is the portal's unchanged default behavior. Only
       // an explicit array restricts retrieval.
@@ -708,8 +713,14 @@ router.post('/chat/redact', requireServiceRequest, async (req, res, next) => {
 
 // ---------------------------------------------------------------------------
 // POST /api/knowledge/gaps
-// Explicit save of a knowledge gap — called by the portal when the user
-// chooses to save. The query endpoint no longer writes gaps automatically.
+// Explicit save of a knowledge gap — called by the portal when a user
+// flags a question themselves. Backlog M4: runKnowledgeQuery (services/
+// runKnowledgeQuery.js) now ALSO auto-persists a gap on every detection, so
+// this route's insert usually lands on an already-existing row via the
+// shared idempotencyKey (see services/knowledgeGapKey.js and
+// supabaseService.js#createKnowledgeGap's upsert-on-conflict) rather than
+// creating a second one — reportedBy: 'user' here only takes effect on a
+// true first-insert (no matching auto-detected gap exists yet).
 // Body: { clientId, sessionId, question, reason, messageId? }
 // Returns: { success: true, gap }
 // ---------------------------------------------------------------------------
@@ -722,6 +733,7 @@ router.post('/gaps', requireMemberContext, async (req, res, next) => {
     }
     await supabaseService.requireActiveClient(clientId);
     const { memberId } = req.context;
+    const idempotencyKey = buildGapIdempotencyKey({ clientId, question });
     const gap = await supabaseService.createKnowledgeGap({
       clientId,
       sessionId,
@@ -729,8 +741,55 @@ router.post('/gaps', requireMemberContext, async (req, res, next) => {
       question,
       reason,
       memberId,
+      origin: 'portal',
+      idempotencyKey,
+      reportedBy: 'user',
     });
     res.json({ success: true, gap });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Knowledge gap admin review (Backlog M5)
+//
+// requireServiceRequest-signed, following the same pattern as the
+// collections routes above (Backlog H4) — GET-with-signed-JSON-body for the
+// per-client list, PATCH for the status transition. Not member-facing;
+// called by Relativity's admin console only.
+// ---------------------------------------------------------------------------
+
+// GET /api/knowledge/gaps/:clientId  Payload (req.servicePayload): { status? }
+router.get('/gaps/:clientId', requireServiceRequest, async (req, res, next) => {
+  try {
+    const { clientId } = req.serviceRequest;
+    if (req.params.clientId !== clientId) {
+      return res.status(400).json({ error: 'URL clientId does not match the signed envelope.' });
+    }
+    await supabaseService.requireActiveClient(clientId);
+    const status = req.servicePayload && typeof req.servicePayload.status === 'string' ? req.servicePayload.status : null;
+    const gaps = await supabaseService.listKnowledgeGapsByClient(clientId, { status });
+    res.json({ gaps });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/knowledge/gaps/:id  Payload (req.servicePayload): { status }
+router.patch('/gaps/:id', requireServiceRequest, async (req, res, next) => {
+  try {
+    const { clientId } = req.serviceRequest;
+    const { status } = req.servicePayload || {};
+    const validStatuses = ['open', 'reviewed', 'resolved', 'ignored'];
+    if (!status || !validStatuses.includes(status)) {
+      return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+    }
+    const gap = await supabaseService.getKnowledgeGapById(req.params.id);
+    if (!gap) return res.status(404).json({ error: 'Gap not found.' });
+    if (gap.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
+    const updated = await supabaseService.updateKnowledgeGapStatus(req.params.id, status);
+    res.json({ gap: updated });
   } catch (err) {
     next(err);
   }

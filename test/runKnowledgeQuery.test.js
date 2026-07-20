@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { runKnowledgeQuery } = require('../services/runKnowledgeQuery');
+const { buildGapIdempotencyKey } = require('../services/knowledgeGapKey');
 
 const CLIENT_ID = 'client-1';
 
@@ -16,11 +17,35 @@ const CLIENT_ID = 'client-1';
 function createFakeSupabaseService() {
   const sessions = new Map();
   const messages = [];
+  const gapsByIdempotencyKey = new Map();
   let nextSessionId = 1;
   let nextMessageId = 1;
+  let nextGapId = 1;
 
   return {
-    calls: { createChatSession: 0, createChatMessage: 0 },
+    calls: { createChatSession: 0, createChatMessage: 0, createKnowledgeGap: 0 },
+    // Mirrors supabaseService.js#createKnowledgeGap's real upsert-on-conflict
+    // semantics (in-memory, keyed on idempotencyKey) so dedup behavior is
+    // actually exercised, not just stubbed out.
+    async createKnowledgeGap(args) {
+      this.calls.createKnowledgeGap += 1;
+      const key = args.idempotencyKey;
+      if (key && gapsByIdempotencyKey.has(key)) {
+        const existing = gapsByIdempotencyKey.get(key);
+        existing.reason = args.reason;
+        existing.session_id = args.sessionId;
+        existing.message_id = args.messageId;
+        return existing;
+      }
+      const gap = {
+        id: `gap-${nextGapId++}`, client_id: args.clientId, session_id: args.sessionId,
+        message_id: args.messageId, question: args.question, reason: args.reason,
+        member_id: args.memberId, origin: args.origin, origin_metadata: args.originMetadata,
+        idempotency_key: key, reported_by: args.reportedBy, status: 'open',
+      };
+      if (key) gapsByIdempotencyKey.set(key, gap);
+      return gap;
+    },
     async getChatSessionByIdempotencyKey(clientId, idempotencyKey) {
       for (const session of sessions.values()) {
         if (session.client_id === clientId && session.idempotency_key === idempotencyKey) return session;
@@ -58,6 +83,7 @@ function createFakeSupabaseService() {
     },
     _sessions: sessions,
     _messages: messages,
+    _gapsByIdempotencyKey: gapsByIdempotencyKey,
   };
 }
 
@@ -101,17 +127,63 @@ test('a normal question with retrieved chunks returns a grounded answer with sou
   assert.ok(result.userMessageId);
 });
 
-test('no chunks found returns a knowledge-gap result with gapReason no_chunks_found, and does not create a second gap record', async () => {
+test('no chunks found returns a knowledge-gap result with gapReason no_chunks_found, and auto-persists a system-reported gap', async () => {
   const supabaseService = createFakeSupabaseService();
   const openaiService = createFakeOpenaiService();
-  let gapCreated = false;
-  supabaseService.createKnowledgeGap = async () => { gapCreated = true; };
 
   const result = await runKnowledgeQuery({ clientId: CLIENT_ID, question: 'What is the meaning of life?', origin: 'slack', originMetadata: { teamId: 'T1' }, idempotencyKey: 'slack:Ev001', deps: { supabaseService, openaiService } });
 
   assert.equal(result.isKnowledgeGap, true);
   assert.equal(result.gapReason, 'no_chunks_found');
-  assert.equal(gapCreated, false, 'runKnowledgeQuery must never call createKnowledgeGap itself');
+  assert.equal(supabaseService.calls.createKnowledgeGap, 1, 'runKnowledgeQuery must auto-persist a gap when isKnowledgeGap is true');
+  const [gap] = [...supabaseService._gapsByIdempotencyKey.values()];
+  assert.equal(gap.reported_by, 'system');
+  assert.equal(gap.origin, 'slack');
+  assert.equal(gap.reason, 'no_chunks_found');
+  assert.match(gap.idempotency_key, /^gap:v1:/);
+});
+
+test('a gap-logging failure is swallowed and never breaks the user-facing response', async () => {
+  const supabaseService = createFakeSupabaseService();
+  supabaseService.createKnowledgeGap = async () => { throw new Error('db unavailable'); };
+  const openaiService = createFakeOpenaiService();
+
+  const result = await runKnowledgeQuery({ clientId: CLIENT_ID, question: 'What is the meaning of life?', deps: { supabaseService, openaiService } });
+
+  assert.equal(result.isKnowledgeGap, true);
+  assert.equal(result.gapReason, 'no_chunks_found');
+});
+
+test('two questions that are the same after normalization, in the same week, auto-persist onto a single gap row instead of duplicating', async () => {
+  const supabaseService = createFakeSupabaseService();
+  const openaiService = createFakeOpenaiService();
+
+  await runKnowledgeQuery({ clientId: CLIENT_ID, question: 'What is the meaning of life?', origin: 'portal', deps: { supabaseService, openaiService } });
+  await runKnowledgeQuery({ clientId: CLIENT_ID, question: '  what is the meaning of life???  ', origin: 'portal', deps: { supabaseService, openaiService } });
+
+  assert.equal(supabaseService.calls.createKnowledgeGap, 2, 'createKnowledgeGap is called on every detection...');
+  assert.equal(supabaseService._gapsByIdempotencyKey.size, 1, '...but both calls resolve to the same row via the shared idempotency key');
+});
+
+test('a manually-saved gap (POST /api/knowledge/gaps) targeting the same idempotency key as an auto-persisted one lands on the same row without clobbering status/reported_by', async () => {
+  const supabaseService = createFakeSupabaseService();
+
+  const key = buildGapIdempotencyKey({ clientId: CLIENT_ID, question: 'What is our PTO policy?' });
+  const systemGap = await supabaseService.createKnowledgeGap({
+    clientId: CLIENT_ID, sessionId: 's1', messageId: 'm1', question: 'What is our PTO policy?',
+    reason: 'no_chunks_found', origin: 'slack', idempotencyKey: key, reportedBy: 'system',
+  });
+  systemGap.status = 'reviewed'; // simulate an admin having already reviewed this gap
+
+  const userSave = await supabaseService.createKnowledgeGap({
+    clientId: CLIENT_ID, sessionId: 's2', messageId: 'm2', question: 'what is our pto policy?',
+    reason: 'user flagged this as wrong', origin: 'portal', idempotencyKey: key, reportedBy: 'user',
+  });
+
+  assert.equal(userSave.id, systemGap.id, 'same idempotency key must resolve to the same row');
+  assert.equal(userSave.reported_by, 'system', 'reported_by is not overwritten by a later manual save landing on an existing row');
+  assert.equal(userSave.status, 'reviewed', 'status is not clobbered by a later manual save landing on an existing row');
+  assert.equal(userSave.reason, 'user flagged this as wrong', 'reason IS refreshed on conflict');
 });
 
 test('an LLM answer indicating the info was not found is treated as a knowledge gap even with retrieved chunks', async () => {
