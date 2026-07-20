@@ -35,6 +35,13 @@
 // thrown, since gap logging is review-workflow/analytics data, not core to
 // answering the user (unlike message persistence above, which is core to
 // session continuity and is allowed to throw).
+//
+// Backlog M13 (revised): gap logging is a deliberate, narrow exception to
+// persistConversation: false below — knowledge_gaps is admin review-queue
+// data, never exposed through any portal chat/session read path, and a
+// gap row is only ever written when a real gap was actually detected (not
+// on every question). Product decision: still store the real question text
+// on a detected gap, for both origins, unchanged by this milestone.
 
 const defaultSupabaseService = require('./supabaseService');
 const defaultOpenaiService = require('./openaiService');
@@ -130,6 +137,7 @@ async function replayExistingSession({ supabaseService, clientId, session }) {
  * @param {object|null} [params.originMetadata] - narrow, safe metadata only (never a token/secret).
  * @param {string|null} [params.idempotencyKey] - Slack: "slack:<event_id>". Never used for portal today.
  * @param {string[]|null} [params.allowedCollectionIds] - null = no restriction (portal default); an array (possibly empty) restricts retrieval.
+ * @param {boolean} [params.persistConversation] - Backlog M13 (revised): default true (portal, unchanged). false means NO knowledge_chat_sessions row and NO knowledge_chat_messages rows are ever created for this call — used by the Slack ask path (both 'slack' and 'slack_dm') so Slack-originated conversations are never persisted. The idempotency-based session-replay short-circuit is skipped in this mode (dedup for Slack instead lives in routes/knowledge.js POST /ask, backed by knowledge_slack_request_log — see services/slackRequestLogService.js — since there is no session to replay from). Knowledge-gap auto-persist (persistGapBestEffort, below) is NOT gated by this flag: a detected gap still stores the real question text, unchanged, per product decision (knowledge_gaps is review-queue data, never exposed through any portal chat/session read path).
  * @param {object} [params.deps] - DI'd for tests; each defaults to the real singleton service.
  */
 async function runKnowledgeQuery({
@@ -142,6 +150,7 @@ async function runKnowledgeQuery({
   originMetadata = null,
   idempotencyKey = null,
   allowedCollectionIds = null,
+  persistConversation = true,
   deps = {},
 }) {
   const supabaseService = deps.supabaseService || defaultSupabaseService;
@@ -155,7 +164,9 @@ async function runKnowledgeQuery({
   // Idempotency short-circuit (§4.19) — only relevant when a caller
   // supplies idempotencyKey without an explicit sessionId (Slack's
   // one-shot-per-event model; portal never sets idempotencyKey today).
-  if (idempotencyKey && !providedSessionId) {
+  // Never applicable when persistConversation is false — there is no
+  // persisted session to look up or replay from (Backlog M13, revised).
+  if (persistConversation && idempotencyKey && !providedSessionId) {
     const existingSession = await supabaseService.getChatSessionByIdempotencyKey(clientId, idempotencyKey);
     if (existingSession) {
       const replayed = await replayExistingSession({ supabaseService, clientId, session: existingSession });
@@ -163,39 +174,47 @@ async function runKnowledgeQuery({
     }
   }
 
-  // Resolve or create the chat session.
-  let sessionId;
-  if (providedSessionId) {
-    const session = await supabaseService.getChatSession(clientId, providedSessionId, memberId, isAdmin);
-    if (!session) {
-      const err = new Error('Session not found');
-      err.status = 404;
-      throw err;
+  // Resolve or create the chat session. Skipped entirely when
+  // persistConversation is false — sessionId/userMsg stay null, and no
+  // knowledge_chat_sessions/knowledge_chat_messages row is ever written
+  // (Backlog M13, revised).
+  let sessionId = null;
+  let userMsg = null;
+  let recentSessionMessages = [];
+
+  if (persistConversation) {
+    if (providedSessionId) {
+      const session = await supabaseService.getChatSession(clientId, providedSessionId, memberId, isAdmin);
+      if (!session) {
+        const err = new Error('Session not found');
+        err.status = 404;
+        throw err;
+      }
+      sessionId = session.id;
+    } else {
+      const title = question.trim().slice(0, 50);
+      const session = await supabaseService.createChatSession(clientId, title, memberId, { origin, originMetadata, idempotencyKey });
+      sessionId = session.id;
     }
-    sessionId = session.id;
-  } else {
-    const title = question.trim().slice(0, 50);
-    const session = await supabaseService.createChatSession(clientId, title, memberId, { origin, originMetadata, idempotencyKey });
-    sessionId = session.id;
+
+    // Save the user message before running RAG so we have its ID for knowledge gap logging.
+    userMsg = await supabaseService.createChatMessage({
+      clientId,
+      sessionId,
+      role: 'user',
+      content: question,
+      memberId,
+    });
+
+    // Load recent session history server-side so follow-up questions can be
+    // classified/retrieved using the actual prior conversation. For Slack,
+    // this session is brand new, so this is always empty — no conversation
+    // memory across separate app_mention events, per §4.12.
+    const recentMessages = await supabaseService.listRecentChatMessages(clientId, sessionId, 8);
+    recentSessionMessages = recentMessages
+      .filter((m) => m.id !== userMsg.id)
+      .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
   }
-
-  // Save the user message before running RAG so we have its ID for knowledge gap logging.
-  const userMsg = await supabaseService.createChatMessage({
-    clientId,
-    sessionId,
-    role: 'user',
-    content: question,
-    memberId,
-  });
-
-  // Load recent session history server-side so follow-up questions can be
-  // classified/retrieved using the actual prior conversation. For Slack,
-  // this session is brand new, so this is always empty — no conversation
-  // memory across separate app_mention events, per §4.12.
-  const recentMessages = await supabaseService.listRecentChatMessages(clientId, sessionId, 8);
-  const recentSessionMessages = recentMessages
-    .filter((m) => m.id !== userMsg.id)
-    .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
 
   const intent = await openaiService.classifyQueryIntent(question, recentSessionMessages);
 
@@ -216,15 +235,17 @@ async function runKnowledgeQuery({
 
   if (!runRetrieval) {
     const answer = openaiService.buildNonRetrievalAnswer(question, intent);
-    await supabaseService.createChatMessage({
-      clientId,
-      sessionId,
-      role: 'assistant',
-      content: answer,
-      sources: [],
-      metadata: { question, retrievalQuery: null, intent, retrievalSkipped: true, isKnowledgeGap: false },
-      memberId,
-    });
+    if (persistConversation) {
+      await supabaseService.createChatMessage({
+        clientId,
+        sessionId,
+        role: 'assistant',
+        content: answer,
+        sources: [],
+        metadata: { question, retrievalQuery: null, intent, retrievalSkipped: true, isKnowledgeGap: false },
+        memberId,
+      });
+    }
     return {
       answer,
       sources: [],
@@ -232,7 +253,7 @@ async function runKnowledgeQuery({
       isKnowledgeGap: false,
       isConversational: intent.intent === 'casual_conversation',
       intent,
-      userMessageId: userMsg.id,
+      userMessageId: userMsg ? userMsg.id : null,
     };
   }
 
@@ -254,20 +275,22 @@ async function runKnowledgeQuery({
 
   if (!chunks.length) {
     const answer = normalizeGapAnswerSource('I couldn\'t find any relevant information in the knowledge base for your question.');
-    await supabaseService.createChatMessage({
-      clientId,
-      sessionId,
-      role: 'assistant',
-      content: answer,
-      sources: [],
-      metadata: { question, retrievalQuery, intent, retrievalSkipped: false, isKnowledgeGap: true, gapReason: 'no_chunks_found' },
-      memberId,
-    });
+    if (persistConversation) {
+      await supabaseService.createChatMessage({
+        clientId,
+        sessionId,
+        role: 'assistant',
+        content: answer,
+        sources: [],
+        metadata: { question, retrievalQuery, intent, retrievalSkipped: false, isKnowledgeGap: true, gapReason: 'no_chunks_found' },
+        memberId,
+      });
+    }
     await persistGapBestEffort({
-      supabaseService, clientId, sessionId, userMessageId: userMsg.id, question,
+      supabaseService, clientId, sessionId, userMessageId: userMsg ? userMsg.id : null, question,
       reason: 'no_chunks_found', memberId, origin, originMetadata,
     });
-    return { answer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'no_chunks_found', userMessageId: userMsg.id, intent };
+    return { answer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'no_chunks_found', userMessageId: userMsg ? userMsg.id : null, intent };
   }
 
   const answer = await openaiService.generateRagAnswer(question, chunks, recentSessionMessages);
@@ -301,33 +324,37 @@ async function runKnowledgeQuery({
 
   if (isGap) {
     const normalizedAnswer = normalizeGapAnswerSource(answer);
+    if (persistConversation) {
+      await supabaseService.createChatMessage({
+        clientId,
+        sessionId,
+        role: 'assistant',
+        content: normalizedAnswer,
+        sources: [],
+        metadata: { ...chunkMetadata, intent, retrievalSkipped: false, isKnowledgeGap: true, gapReason: 'answer_indicated_not_found' },
+        memberId,
+      });
+    }
+    await persistGapBestEffort({
+      supabaseService, clientId, sessionId, userMessageId: userMsg ? userMsg.id : null, question,
+      reason: 'answer_indicated_not_found', memberId, origin, originMetadata,
+    });
+    return { answer: normalizedAnswer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'answer_indicated_not_found', userMessageId: userMsg ? userMsg.id : null, intent };
+  }
+
+  if (persistConversation) {
     await supabaseService.createChatMessage({
       clientId,
       sessionId,
       role: 'assistant',
-      content: normalizedAnswer,
-      sources: [],
-      metadata: { ...chunkMetadata, intent, retrievalSkipped: false, isKnowledgeGap: true, gapReason: 'answer_indicated_not_found' },
+      content: answer,
+      sources,
+      metadata: { ...chunkMetadata, intent, retrievalSkipped: false, isKnowledgeGap: false },
       memberId,
     });
-    await persistGapBestEffort({
-      supabaseService, clientId, sessionId, userMessageId: userMsg.id, question,
-      reason: 'answer_indicated_not_found', memberId, origin, originMetadata,
-    });
-    return { answer: normalizedAnswer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'answer_indicated_not_found', userMessageId: userMsg.id, intent };
   }
 
-  await supabaseService.createChatMessage({
-    clientId,
-    sessionId,
-    role: 'assistant',
-    content: answer,
-    sources,
-    metadata: { ...chunkMetadata, intent, retrievalSkipped: false, isKnowledgeGap: false },
-    memberId,
-  });
-
-  return { answer, sources, sessionId, isKnowledgeGap: false, userMessageId: userMsg.id, intent };
+  return { answer, sources, sessionId, isKnowledgeGap: false, userMessageId: userMsg ? userMsg.id : null, intent };
 }
 
 module.exports = {

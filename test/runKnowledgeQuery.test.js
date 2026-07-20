@@ -298,3 +298,103 @@ test('retrieval is scoped strictly to the requesting client (client_id passed th
   await runKnowledgeQuery({ clientId: 'client-isolated', question: 'x', deps: { supabaseService, openaiService } });
   assert.equal(capturedClientId, 'client-isolated');
 });
+
+// Backlog M13 (revised): persistConversation: false is how Slack-originated
+// questions (both 'slack' and 'slack_dm') are now run — no
+// knowledge_chat_sessions row and no knowledge_chat_messages rows are ever
+// created. Dedup for retried/duplicate calls moves to the caller
+// (routes/knowledge.js POST /ask + services/supabaseService.js#claimSlackRequest,
+// see test/slackRequestLogService.test.js), so runKnowledgeQuery no longer
+// needs (or performs) a session-based idempotency short-circuit in this mode.
+
+test('persistConversation: false never creates a chat session or chat messages, for a normal grounded answer', async () => {
+  const supabaseService = createFakeSupabaseService();
+  supabaseService.searchChunksWithTitleBoost = async () => ({
+    chunks: [{ document_id: 'doc-1', similarity: 0.8, metadata: { fileName: 'PTO.pdf', pageNumber: 2 } }],
+    matchedDocumentIds: [],
+  });
+  const openaiService = createFakeOpenaiService();
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID,
+    question: 'What is our PTO policy?',
+    origin: 'slack',
+    idempotencyKey: 'slack:Ev001',
+    persistConversation: false,
+    deps: { supabaseService, openaiService },
+  });
+
+  assert.equal(supabaseService.calls.createChatSession, 0, 'no knowledge_chat_sessions row may ever be created for Slack');
+  assert.equal(supabaseService.calls.createChatMessage, 0, 'no knowledge_chat_messages row may ever be created for Slack');
+  assert.equal(result.answer, 'You get 15 days of PTO per year.');
+  assert.equal(result.sessionId, null);
+  assert.equal(result.userMessageId, null);
+});
+
+test('persistConversation: false never creates a session/message even on the no-non-retrieval-answer path', async () => {
+  const supabaseService = createFakeSupabaseService();
+  const openaiService = createFakeOpenaiService({ intent: { intent: 'casual_conversation', confidence: 0.95, shouldRunRetrieval: false, reason: 'greeting' } });
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID,
+    question: 'hello!',
+    origin: 'slack_dm',
+    idempotencyKey: 'slack:Ev002',
+    persistConversation: false,
+    deps: { supabaseService, openaiService },
+  });
+
+  assert.equal(supabaseService.calls.createChatSession, 0);
+  assert.equal(supabaseService.calls.createChatMessage, 0);
+  assert.equal(result.isConversational, true);
+});
+
+test('persistConversation: false still auto-persists a knowledge_gaps row with the real question when a gap is detected (product decision: gap review data is exempt)', async () => {
+  const supabaseService = createFakeSupabaseService();
+  const openaiService = createFakeOpenaiService();
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID,
+    question: 'What is the meaning of life?',
+    origin: 'slack',
+    originMetadata: { teamId: 'T1' },
+    idempotencyKey: 'slack:Ev003',
+    persistConversation: false,
+    deps: { supabaseService, openaiService },
+  });
+
+  assert.equal(result.isKnowledgeGap, true);
+  assert.equal(supabaseService.calls.createChatSession, 0);
+  assert.equal(supabaseService.calls.createChatMessage, 0);
+  assert.equal(supabaseService.calls.createKnowledgeGap, 1, 'a detected gap must still be logged, even for Slack under persistConversation: false');
+
+  const [gap] = [...supabaseService._gapsByIdempotencyKey.values()];
+  assert.equal(gap.question, 'What is the meaning of life?', 'the real question text is retained on a detected gap by product decision');
+  assert.equal(gap.session_id, null, 'no session exists to reference');
+  assert.equal(gap.message_id, null, 'no message exists to reference');
+});
+
+test('persistConversation: false skips the idempotency-based session-replay short-circuit — the pipeline runs every time (dedup is the caller\'s job)', async () => {
+  const supabaseService = createFakeSupabaseService();
+  const openaiService = createFakeOpenaiService();
+
+  await runKnowledgeQuery({
+    clientId: CLIENT_ID,
+    question: 'What is our PTO policy?',
+    origin: 'slack',
+    idempotencyKey: 'slack:Ev004',
+    persistConversation: false,
+    deps: { supabaseService, openaiService },
+  });
+  const second = await runKnowledgeQuery({
+    clientId: CLIENT_ID,
+    question: 'What is our PTO policy?',
+    origin: 'slack',
+    idempotencyKey: 'slack:Ev004',
+    persistConversation: false,
+    deps: { supabaseService, openaiService },
+  });
+
+  assert.equal(openaiService.calls.classifyQueryIntent, 2, 'no session exists to replay from, so the pipeline runs on every call');
+  assert.equal(second.replayed, undefined);
+});

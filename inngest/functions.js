@@ -416,12 +416,20 @@ const reindexDocument = inngest.createFunction(
 //
 // step.run granularity matters here: if 'deliver-to-relativity' fails and
 // Inngest retries the function, 'run-knowledge-query's already-persisted
-// return value is reused rather than re-run — no second OpenAI call, no
-// risk of a second (differently-worded) answer for the same event. Even if
-// this function is retried after 'run-knowledge-query' already completed
-// on a prior attempt, runKnowledgeQuery's own idempotencyKey short-circuit
-// (services/runKnowledgeQuery.js, migrations/005_slack_origin_tracking.sql)
-// means calling it again is still safe.
+// return value is reused rather than re-run (Inngest's own step
+// memoization) — no second OpenAI call, no risk of a second
+// (differently-worded) answer for the same event.
+//
+// Backlog M13 (revised): runKnowledgeQuery is called with
+// persistConversation: false — Slack conversations (both 'slack' and
+// 'slack_dm') are never persisted to knowledge_chat_sessions/
+// knowledge_chat_messages. Duplicate-enqueue protection is now claimed
+// upstream, before this function ever runs (routes/knowledge.js POST /ask,
+// services/supabaseService.js#claimSlackRequest,
+// migrations/009_slack_request_log.sql) rather than via a session lookup
+// here. This function marks that same knowledge_slack_request_log row
+// delivered/failed once it knows the outcome — operational metadata only,
+// never the question/answer/citations.
 // ---------------------------------------------------------------------------
 
 const slackQuestionRequested = inngest.createFunction(
@@ -449,6 +457,15 @@ const slackQuestionRequested = inngest.createFunction(
         } catch (deliverErr) {
           console.error('[slack-question] onFailure deliver callback also failed', { error: deliverErr.message });
         }
+        // Backlog M13 (revised): terminal failure on the dedup log — a
+        // sanitized error category only, never the raw error message.
+        // Best-effort: never let this throw and mask the deliver callback
+        // above having already run.
+        try {
+          await supabaseService.markSlackRequestFailed(idempotencyKey, 'AIKB_PROCESSING_FAILED');
+        } catch (markErr) {
+          console.error('[slack-question] onFailure markSlackRequestFailed also failed', { error: markErr.message });
+        }
       }
     },
   },
@@ -474,6 +491,12 @@ const slackQuestionRequested = inngest.createFunction(
         // this event (see routes/knowledge.js POST /ask), but re-guarded
         // here too rather than trusting event.data shape blindly.
         allowedCollectionIds: Array.isArray(allowedCollectionIds) ? allowedCollectionIds : [],
+        // Backlog M13 (revised): Slack conversations are never persisted —
+        // no knowledge_chat_sessions/knowledge_chat_messages row for
+        // either 'slack' or 'slack_dm'. Duplicate-enqueue protection for
+        // this idempotencyKey already happened upstream, at claim time in
+        // routes/knowledge.js POST /ask.
+        persistConversation: false,
       });
     });
 
@@ -489,6 +512,13 @@ const slackQuestionRequested = inngest.createFunction(
           sessionId: result.sessionId,
         },
       });
+    });
+
+    // Backlog M13 (revised): terminal, operational-metadata-only status —
+    // never the answer/sources themselves (those already went out via the
+    // deliver-to-relativity step above and are not re-stored here).
+    await step.run('mark-request-delivered', async () => {
+      await supabaseService.markSlackRequestDelivered(idempotencyKey);
     });
 
     return { delivered: true, sessionId: result.sessionId, isKnowledgeGap: result.isKnowledgeGap };

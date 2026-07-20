@@ -1021,6 +1021,91 @@ async function listRecentChatMessages(clientId, sessionId, limit = 8) {
 }
 
 // ---------------------------------------------------------------------------
+// Slack request dedup log (Backlog M13, revised — migrations/009_slack_request_log.sql)
+//
+// Replaces the old "look up the chat session by idempotency_key" dedup
+// mechanism now that Slack-originated questions never create a session
+// (see services/runKnowledgeQuery.js's persistConversation: false). Stores
+// ONLY operational metadata (client_id, idempotency_key, origin, status,
+// attempt_count, error_category, timestamps) — never the question, answer,
+// citations, or any chunk/document text.
+// ---------------------------------------------------------------------------
+
+const SLACK_REQUEST_UNIQUE_VIOLATION = '23505';
+
+async function getSlackRequestByIdempotencyKey(idempotencyKey) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_slack_request_log')
+    .select('*')
+    .eq('idempotency_key', idempotencyKey)
+    .maybeSingle();
+  if (error) throw new Error(`getSlackRequestByIdempotencyKey: ${error.message}`);
+  return data || null;
+}
+
+// First call for a given idempotency_key INSERTs and returns { claimed:
+// true, row }: the caller (routes/knowledge.js POST /ask) proceeds to
+// enqueue exactly one Inngest event. A concurrent or retried claim (e.g.
+// Relativity's own in-flow retryWithBackoff around the /ask HTTP call, when
+// the first attempt actually succeeded but its response was lost) hits the
+// UNIQUE index, is caught here as a conflict, and returns { claimed: false,
+// row } instead — attempt_count on the existing row is bumped so retries
+// are visible operationally, but no second Inngest event/LLM call/Slack
+// reply is ever triggered.
+async function claimSlackRequest({ clientId, idempotencyKey, origin }) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_slack_request_log')
+    .insert({ client_id: clientId, idempotency_key: idempotencyKey, origin })
+    .select()
+    .single();
+
+  if (!error) return { claimed: true, row: data };
+
+  if (error.code === SLACK_REQUEST_UNIQUE_VIOLATION) {
+    const existing = await getSlackRequestByIdempotencyKey(idempotencyKey);
+    if (!existing) return { claimed: false, row: null };
+    const { data: bumped, error: bumpErr } = await aikbSupabase
+      .from('knowledge_slack_request_log')
+      .update({ attempt_count: existing.attempt_count + 1, updated_at: new Date().toISOString() })
+      .eq('id', existing.id)
+      .select()
+      .maybeSingle();
+    if (bumpErr) throw new Error(`claimSlackRequest (attempt bump): ${bumpErr.message}`);
+    return { claimed: false, row: bumped || existing };
+  }
+
+  throw new Error(`claimSlackRequest: ${error.message}`);
+}
+
+async function markSlackRequestDelivered(idempotencyKey) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_slack_request_log')
+    .update({ status: 'delivered', updated_at: new Date().toISOString() })
+    .eq('idempotency_key', idempotencyKey)
+    .select()
+    .maybeSingle();
+  if (error) throw new Error(`markSlackRequestDelivered: ${error.message}`);
+  return data || null;
+}
+
+// errorCategory must be a safe, internal string constant only (e.g.
+// 'AIKB_PROCESSING_FAILED') — never a raw error message or stack trace.
+async function markSlackRequestFailed(idempotencyKey, errorCategory) {
+  const { data, error } = await aikbSupabase
+    .from('knowledge_slack_request_log')
+    .update({
+      status: 'failed',
+      error_category: errorCategory || 'UNKNOWN_ERROR',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('idempotency_key', idempotencyKey)
+    .select()
+    .maybeSingle();
+  if (error) throw new Error(`markSlackRequestFailed: ${error.message}`);
+  return data || null;
+}
+
+// ---------------------------------------------------------------------------
 // Duplicate content detection
 // ---------------------------------------------------------------------------
 
@@ -1254,6 +1339,10 @@ module.exports = {
   listKnowledgeGapsByClient,
   getKnowledgeGapById,
   updateKnowledgeGapStatus,
+  getSlackRequestByIdempotencyKey,
+  claimSlackRequest,
+  markSlackRequestDelivered,
+  markSlackRequestFailed,
   getIndexedDocumentByContentHash,
   getClientSummaryData,
   getClientAnalyticsData,

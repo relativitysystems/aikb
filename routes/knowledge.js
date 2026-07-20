@@ -542,15 +542,26 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
 //
 // Never receives or forwards a Slack token/secret — only clientId, the
 // already-extracted question, and narrow origin metadata (§4.9).
+//
+// Backlog M13 (revised): the resulting AIKB pipeline run is always
+// persistConversation: false (set in inngest/functions.js) — Slack
+// conversations (both 'slack' and 'slack_dm') are never persisted to
+// knowledge_chat_sessions/knowledge_chat_messages. This route claims a
+// knowledge_slack_request_log row (services/supabaseService.js#claimSlackRequest)
+// BEFORE enqueueing, so a retried/duplicate call with the same
+// idempotencyKey (Relativity's own in-flow retryWithBackoff around this
+// HTTP call) never triggers a second Inngest event, second LLM call, or
+// second Slack reply.
 // ---------------------------------------------------------------------------
 
 // Backlog M13: caller-supplied, but allowlisted rather than trusted as-is —
-// 'slack_dm' (vs the pre-existing 'slack' for channel @mentions) tags the
-// resulting session so it can be excluded from portal-facing chat history
-// (see supabaseService.js#listChatSessions / #getChatSession). Anything
-// unexpected safely falls back to 'slack'. Exported (unlike this file's
-// other route logic) so it has direct unit coverage without requiring a
-// real Inngest send — mirrors runKnowledgeQuery.js's exported pure helpers.
+// 'slack_dm' (vs the pre-existing 'slack' for channel @mentions) is
+// retained only as non-content operational metadata on the
+// knowledge_slack_request_log row (never on a persisted session — see
+// runKnowledgeQuery.js). Anything unexpected safely falls back to 'slack'.
+// Exported (unlike this file's other route logic) so it has direct unit
+// coverage without requiring a real Inngest send — mirrors
+// runKnowledgeQuery.js's exported pure helpers.
 function resolveAskOrigin(origin) {
   return ['slack', 'slack_dm'].includes(origin) ? origin : 'slack';
 }
@@ -567,6 +578,14 @@ router.post('/ask', requireServiceRequest, async (req, res, next) => {
     await supabaseService.requireActiveClient(clientId);
 
     const safeOrigin = resolveAskOrigin(origin);
+
+    // Backlog M13 (revised): claim-before-enqueue dedup. A duplicate claim
+    // means this idempotencyKey was already accepted once — never enqueue a
+    // second Inngest event for it (see services/supabaseService.js#claimSlackRequest).
+    const { claimed } = await supabaseService.claimSlackRequest({ clientId, idempotencyKey, origin: safeOrigin });
+    if (!claimed) {
+      return res.json({ accepted: true, eventId: null, duplicate: true });
+    }
 
     const event = await inngest.send({
       name: 'knowledge/slack.question.requested',
