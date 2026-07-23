@@ -94,6 +94,7 @@ function loadSupabaseServiceWithFakeClient(store) {
   };
 
   delete require.cache[require.resolve('../config')];
+  delete require.cache[require.resolve('../services/aikbDatabaseProvider')];
   delete require.cache[require.resolve('../services/supabaseService')];
   const supabaseService = require('../services/supabaseService');
 
@@ -103,6 +104,7 @@ function loadSupabaseServiceWithFakeClient(store) {
       if (previous) require.cache[supabaseJsPath] = previous;
       else delete require.cache[supabaseJsPath];
       delete require.cache[require.resolve('../config')];
+      delete require.cache[require.resolve('../services/aikbDatabaseProvider')];
       delete require.cache[require.resolve('../services/supabaseService')];
     },
   };
@@ -170,7 +172,7 @@ test('markSlackRequestDelivered transitions a claimed row to delivered', async (
   const { supabaseService, restore } = loadSupabaseServiceWithFakeClient({});
   try {
     await supabaseService.claimSlackRequest({ clientId: CLIENT_ID, idempotencyKey: 'slack:Ev001', origin: 'slack' });
-    const updated = await supabaseService.markSlackRequestDelivered('slack:Ev001');
+    const updated = await supabaseService.markSlackRequestDelivered(CLIENT_ID, 'slack:Ev001');
     assert.equal(updated.status, 'delivered');
   } finally {
     restore();
@@ -181,7 +183,7 @@ test('markSlackRequestFailed transitions a claimed row to failed with a sanitize
   const { supabaseService, restore } = loadSupabaseServiceWithFakeClient({});
   try {
     await supabaseService.claimSlackRequest({ clientId: CLIENT_ID, idempotencyKey: 'slack:Ev001', origin: 'slack' });
-    const updated = await supabaseService.markSlackRequestFailed('slack:Ev001', 'AIKB_PROCESSING_FAILED');
+    const updated = await supabaseService.markSlackRequestFailed(CLIENT_ID, 'slack:Ev001', 'AIKB_PROCESSING_FAILED');
     assert.equal(updated.status, 'failed');
     assert.equal(updated.error_category, 'AIKB_PROCESSING_FAILED');
   } finally {

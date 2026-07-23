@@ -99,7 +99,7 @@ const ingestDocument = inngest.createFunction(
       console.log(`[ingest] START update-job-running | ${tag(jobId, sourceFileId, documentId)}`);
       const t3 = Date.now();
       await step.run('update-job-running', async () => {
-        await supabaseService.updateIngestionJob(job.id, { status: 'running' });
+        await supabaseService.updateIngestionJob(clientId, job.id, { status: 'running' });
       });
       console.log(`[ingest] END   update-job-running | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t3}ms`);
 
@@ -117,7 +117,7 @@ const ingestDocument = inngest.createFunction(
           const dlResult = await withTimeout(
             30_000,
             'index-document-core / downloadFromStorage',
-            supabaseService.downloadFromStorage(storagePath)
+            supabaseService.downloadFromStorage(clientId, storagePath)
           );
           if (dlResult.buffer.length > config.maxUploadBytes) {
             throw new Error(`Uploaded file exceeds max size limit of ${config.maxUploadBytes} bytes`);
@@ -144,7 +144,7 @@ const ingestDocument = inngest.createFunction(
           // Unchanged hash — skip if same content re-uploaded (uses `existing` from outer step closure)
           if (existing && existing.content_hash === contentHash && !forceReindex) {
             console.log(`[ingest] SKIP unchanged hash | ${tag(jobId, sourceFileId, null)}`);
-            await supabaseService.updateIngestionJob(job.id, { status: 'completed', documentId: existing.id });
+            await supabaseService.updateIngestionJob(clientId, job.id, { status: 'completed', documentId: existing.id });
             return { skipped: true, reason: 'content hash unchanged', documentId: existing.id, chunkCount: 0, pageCount, contentHash };
           }
 
@@ -155,7 +155,7 @@ const ingestDocument = inngest.createFunction(
             );
             if (contentDuplicate) {
               console.log(`[ingest] SKIP duplicate content | ${tag(jobId, sourceFileId, null)}`);
-              await supabaseService.updateIngestionJob(job.id, { status: 'completed', documentId: contentDuplicate.id });
+              await supabaseService.updateIngestionJob(clientId, job.id, { status: 'completed', documentId: contentDuplicate.id });
               return { skipped: true, reason: 'duplicate content', documentId: contentDuplicate.id, chunkCount: 0, pageCount, contentHash };
             }
           }
@@ -180,7 +180,7 @@ const ingestDocument = inngest.createFunction(
           await withTimeout(
             15_000,
             'index-document-core / deleteChunksForDocument',
-            supabaseService.deleteChunksForDocument(localDocumentId)
+            supabaseService.deleteChunksForDocument(clientId, localDocumentId)
           );
 
           // Chunk text — preserve per-page metadata for PDFs
@@ -224,7 +224,7 @@ const ingestDocument = inngest.createFunction(
             embedding: embeddings[i],
             metadata: chunk.metadata,
           }));
-          await supabaseService.insertKnowledgeChunks(rows);
+          await supabaseService.insertKnowledgeChunks(clientId, rows);
           console.log(`[ingest] inserted chunk count=${rows.length}`);
 
           return {
@@ -240,7 +240,7 @@ const ingestDocument = inngest.createFunction(
           // Write document error before re-throwing so the DB stays consistent
           // even when Inngest retries exhaust and the outer catch can't see localDocumentId.
           if (localDocumentId) {
-            await supabaseService.markDocumentError(localDocumentId, err.message).catch((dbErr) => {
+            await supabaseService.markDocumentError(clientId, localDocumentId, err.message).catch((dbErr) => {
               console.error('[ingest] markDocumentError failed:', dbErr.message);
             });
           }
@@ -267,7 +267,7 @@ const ingestDocument = inngest.createFunction(
       console.log(`[ingest] START mark-indexed | ${tag(jobId, sourceFileId, documentId)}`);
       const t5 = Date.now();
       await step.run('mark-indexed', async () => {
-        await supabaseService.markDocumentIndexed(documentId);
+        await supabaseService.markDocumentIndexed(clientId, documentId);
       });
       console.log(`[ingest] END   mark-indexed | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t5}ms`);
 
@@ -275,7 +275,7 @@ const ingestDocument = inngest.createFunction(
       console.log(`[ingest] START complete-job | ${tag(jobId, sourceFileId, documentId)}`);
       const t6 = Date.now();
       await step.run('complete-job', async () => {
-        await supabaseService.updateIngestionJob(job.id, { status: 'completed', documentId });
+        await supabaseService.updateIngestionJob(clientId, job.id, { status: 'completed', documentId });
       });
       console.log(`[ingest] END   complete-job | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t6}ms`);
 
@@ -283,9 +283,9 @@ const ingestDocument = inngest.createFunction(
 
     } catch (err) {
       console.error(`[ingest] ERROR | ${tag(jobId, sourceFileId, documentId)} | ${err.message}`);
-      if (jobId) await supabaseService.logIngestionError(jobId, documentId || null, err);
+      if (jobId) await supabaseService.logIngestionError(clientId, jobId, documentId || null, err);
       if (documentId) {
-        await supabaseService.markDocumentError(documentId, err.message).catch((dbErr) => {
+        await supabaseService.markDocumentError(clientId, documentId, err.message).catch((dbErr) => {
           console.error('[ingest] markDocumentError failed:', dbErr.message);
         });
       }
@@ -319,7 +319,7 @@ const deleteDocument = inngest.createFunction(
     // -- Step 1: Find document ------------------------------------------------
     const doc = await step.run('find-document', async () => {
       if (inputDocumentId) {
-        const found = await supabaseService.getKnowledgeDocumentById(inputDocumentId);
+        const found = await supabaseService.getKnowledgeDocumentById(clientId, inputDocumentId);
         if (found && found.client_id !== clientId) {
           throw new Error('Document does not belong to client');
         }
@@ -334,18 +334,18 @@ const deleteDocument = inngest.createFunction(
 
     // -- Step 2: Delete chunks ------------------------------------------------
     await step.run('delete-chunks', async () => {
-      await supabaseService.deleteChunksForDocument(doc.id);
+      await supabaseService.deleteChunksForDocument(clientId, doc.id);
     });
 
     // -- Step 3: Mark document deleted ----------------------------------------
     await step.run('mark-deleted', async () => {
-      await supabaseService.markDocumentDeleted(doc.id);
+      await supabaseService.markDocumentDeleted(clientId, doc.id);
     });
 
     // -- Step 4 (optional): Remove file from Supabase Storage -----------------
     if (doc.storage_path) {
       await step.run('delete-storage-file', async () => {
-        await supabaseService.deleteFromStorage(doc.storage_path);
+        await supabaseService.deleteFromStorage(clientId, doc.storage_path);
       });
     }
 
@@ -462,7 +462,7 @@ const slackQuestionRequested = inngest.createFunction(
         // Best-effort: never let this throw and mask the deliver callback
         // above having already run.
         try {
-          await supabaseService.markSlackRequestFailed(idempotencyKey, 'AIKB_PROCESSING_FAILED');
+          await supabaseService.markSlackRequestFailed(clientId, idempotencyKey, 'AIKB_PROCESSING_FAILED');
         } catch (markErr) {
           console.error('[slack-question] onFailure markSlackRequestFailed also failed', { error: markErr.message });
         }
@@ -518,7 +518,7 @@ const slackQuestionRequested = inngest.createFunction(
     // never the answer/sources themselves (those already went out via the
     // deliver-to-relativity step above and are not re-stored here).
     await step.run('mark-request-delivered', async () => {
-      await supabaseService.markSlackRequestDelivered(idempotencyKey);
+      await supabaseService.markSlackRequestDelivered(clientId, idempotencyKey);
     });
 
     return { delivered: true, sessionId: result.sessionId, isKnowledgeGap: result.isKnowledgeGap };

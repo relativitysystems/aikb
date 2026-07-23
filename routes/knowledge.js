@@ -161,7 +161,7 @@ router.delete('/document/:id', requireServiceRequest, async (req, res, next) => 
     await supabaseService.requireActiveClient(clientId);
 
     if (documentId) {
-      const doc = await supabaseService.getKnowledgeDocumentById(documentId);
+      const doc = await supabaseService.getKnowledgeDocumentById(clientId, documentId);
       if (!doc) return res.status(404).json({ error: 'Document not found.' });
       if (doc.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
     }
@@ -296,11 +296,11 @@ router.patch('/collections/:id', requireServiceRequest, async (req, res, next) =
     }
     await supabaseService.requireActiveClient(clientId);
 
-    const collection = await supabaseService.getCollectionById(req.params.id);
+    const collection = await supabaseService.getCollectionById(clientId, req.params.id);
     if (!collection) return res.status(404).json({ error: 'Collection not found.' });
     if (collection.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
 
-    const updated = await supabaseService.renameCollection(req.params.id, trimmed);
+    const updated = await supabaseService.renameCollection(clientId, req.params.id, trimmed);
     res.json({ collection: updated });
   } catch (err) {
     if (err.code === 'DUPLICATE_NAME') {
@@ -319,7 +319,7 @@ router.delete('/collections/:id', requireServiceRequest, async (req, res, next) 
     const { clientId } = req.serviceRequest;
     await supabaseService.requireActiveClient(clientId);
 
-    const collection = await supabaseService.getCollectionById(req.params.id);
+    const collection = await supabaseService.getCollectionById(clientId, req.params.id);
     if (!collection) return res.status(404).json({ error: 'Collection not found.' });
     if (collection.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
     if (collection.is_default) {
@@ -332,7 +332,7 @@ router.delete('/collections/:id', requireServiceRequest, async (req, res, next) 
       return res.status(409).json({ error: 'Collection is not empty.' });
     }
 
-    await supabaseService.deleteCollection(req.params.id);
+    await supabaseService.deleteCollection(clientId, req.params.id);
     res.json({ success: true });
   } catch (err) {
     if (err.code === 'NOT_EMPTY') {
@@ -366,16 +366,16 @@ router.patch('/document/:id/collection', requireServiceRequest, async (req, res,
     await supabaseService.requireActiveClient(clientId);
 
     const doc = documentId
-      ? await supabaseService.getKnowledgeDocumentById(documentId)
+      ? await supabaseService.getKnowledgeDocumentById(clientId, documentId)
       : await supabaseService.getKnowledgeDocumentBySourceId(clientId, sourceProvider, sourceFileId);
     if (!doc) return res.status(404).json({ error: 'Document not found.' });
     if (doc.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
 
-    const collection = await supabaseService.getCollectionById(collectionId);
+    const collection = await supabaseService.getCollectionById(clientId, collectionId);
     if (!collection) return res.status(404).json({ error: 'Collection not found.' });
     if (collection.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
 
-    const updated = await supabaseService.moveDocumentCollection(doc.id, collectionId);
+    const updated = await supabaseService.moveDocumentCollection(clientId, doc.id, collectionId);
     res.json({ document: updated });
   } catch (err) {
     next(err);
@@ -818,10 +818,10 @@ router.patch('/gaps/:id', requireServiceRequest, async (req, res, next) => {
     if (!status || !validStatuses.includes(status)) {
       return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
     }
-    const gap = await supabaseService.getKnowledgeGapById(req.params.id);
+    const gap = await supabaseService.getKnowledgeGapById(clientId, req.params.id);
     if (!gap) return res.status(404).json({ error: 'Gap not found.' });
     if (gap.client_id !== clientId) return res.status(403).json({ error: 'Access denied.' });
-    const updated = await supabaseService.updateKnowledgeGapStatus(req.params.id, status);
+    const updated = await supabaseService.updateKnowledgeGapStatus(clientId, req.params.id, status);
     res.json({ gap: updated });
   } catch (err) {
     next(err);

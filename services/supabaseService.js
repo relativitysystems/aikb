@@ -2,12 +2,21 @@
 
 const { createClient } = require('@supabase/supabase-js');
 const config = require('../config');
+const { getAikbDatabase, getSharedAikbDatabaseForAdminOperation } = require('./aikbDatabaseProvider');
 
-const aikbSupabase = createClient(
-  config.supabase.aikb.url,
-  config.supabase.aikb.serviceKey
-);
-
+// AIKB's own Supabase client is no longer constructed here — every function
+// below resolves it per-call via services/aikbDatabaseProvider.js#getAikbDatabase(clientId)
+// (ADR-008, Architecture repo). The provider caches a single shared client,
+// so this is not a new client per request; it's the same one, just resolved
+// through one centralized, client-aware entry point instead of a
+// module-level constant, so a future dedicated-database implementation can
+// change what a given clientId resolves to without touching any of these
+// functions' bodies.
+//
+// The Global Supabase client remains a separate, static, module-level
+// client — identity, client membership, and control-plane data live in
+// Relativity_Global and are out of scope for AIKB's database-routing
+// abstraction (ADR-008 explicitly does not touch this client).
 const globalSupabase = createClient(
   config.supabase.global.url,
   config.supabase.global.serviceKey
@@ -17,10 +26,10 @@ const globalSupabase = createClient(
 // Supabase Storage
 // ---------------------------------------------------------------------------
 
-async function downloadFromStorage(storagePath) {
-  const bucket = config.storage.bucket;
-  const { data, error } = await aikbSupabase.storage
-    .from(bucket)
+async function downloadFromStorage(clientId, storagePath) {
+  const { supabase, storageBucket } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase.storage
+    .from(storageBucket)
     .download(storagePath);
   if (error) throw new Error(`downloadFromStorage: ${error.message} (path: ${storagePath})`);
   if (!data) throw new Error(`downloadFromStorage: no data returned for path: ${storagePath}`);
@@ -31,9 +40,9 @@ async function downloadFromStorage(storagePath) {
   return { buffer, resolvedMimeType };
 }
 
-async function deleteFromStorage(storagePath) {
-  const bucket = config.storage.bucket;
-  const { error } = await aikbSupabase.storage.from(bucket).remove([storagePath]);
+async function deleteFromStorage(clientId, storagePath) {
+  const { supabase, storageBucket } = await getAikbDatabase(clientId);
+  const { error } = await supabase.storage.from(storageBucket).remove([storagePath]);
   if (error) {
     console.warn(`[deleteFromStorage] Could not remove ${storagePath}: ${error.message}`);
   }
@@ -44,7 +53,8 @@ async function deleteFromStorage(storagePath) {
 // ---------------------------------------------------------------------------
 
 async function createIngestionJob(clientId, sourceFileId) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_ingestion_jobs')
     .insert({ client_id: clientId, source_file_id: sourceFileId, status: 'queued' })
     .select()
@@ -53,20 +63,22 @@ async function createIngestionJob(clientId, sourceFileId) {
   return data;
 }
 
-async function updateIngestionJob(jobId, { status, errorMessage, documentId } = {}) {
+async function updateIngestionJob(clientId, jobId, { status, errorMessage, documentId } = {}) {
+  const { supabase } = await getAikbDatabase(clientId);
   const patch = { updated_at: new Date().toISOString() };
   if (status !== undefined) patch.status = status;
   if (errorMessage !== undefined) patch.error_message = errorMessage;
   if (documentId !== undefined) patch.document_id = documentId;
 
-  const { error } = await aikbSupabase
+  const { error } = await supabase
     .from('knowledge_ingestion_jobs')
     .update(patch)
     .eq('id', jobId);
   if (error) throw new Error(`updateIngestionJob: ${error.message}`);
 }
 
-async function logIngestionError(jobId, documentId, err) {
+async function logIngestionError(clientId, jobId, documentId, err) {
+  const { supabase } = await getAikbDatabase(clientId);
   const patch = {
     status: 'failed',
     error_message: err && err.message ? err.message : String(err),
@@ -74,7 +86,7 @@ async function logIngestionError(jobId, documentId, err) {
   };
   if (documentId) patch.document_id = documentId;
 
-  const { error } = await aikbSupabase
+  const { error } = await supabase
     .from('knowledge_ingestion_jobs')
     .update(patch)
     .eq('id', jobId);
@@ -88,7 +100,8 @@ async function logIngestionError(jobId, documentId, err) {
 // more than one of these (see getClientKnowledgeStats) only pays for each
 // underlying table once.
 async function fetchRecentIngestionJobs(clientId, limit = 100) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_ingestion_jobs')
     .select('id, client_id, source_file_id, status, error_message, document_id, created_at, updated_at')
     .eq('client_id', clientId)
@@ -99,7 +112,8 @@ async function fetchRecentIngestionJobs(clientId, limit = 100) {
 }
 
 async function fetchUserQuestionTimestamps(clientId) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_chat_messages')
     .select('created_at')
     .eq('client_id', clientId)
@@ -110,7 +124,8 @@ async function fetchUserQuestionTimestamps(clientId) {
 }
 
 async function fetchKnowledgeGapsCount(clientId) {
-  const { count, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { count, error } = await supabase
     .from('knowledge_gaps')
     .select('*', { count: 'exact', head: true })
     .eq('client_id', clientId);
@@ -130,6 +145,7 @@ async function upsertKnowledgeDocument(
   clientId, provider, fileId, fileName, mimeType, contentHash,
   storagePath = undefined, collectionId = undefined
 ) {
+  const { supabase } = await getAikbDatabase(clientId);
   const now = new Date().toISOString();
   const payload = {
     client_id: clientId,
@@ -146,7 +162,7 @@ async function upsertKnowledgeDocument(
   // on a true first-insert (see inngest/functions.js) so a reindex of an
   // already-moved document never resets its collection back to General.
   if (collectionId) payload.collection_id = collectionId;
-  const { data, error } = await aikbSupabase
+  const { data, error } = await supabase
     .from('knowledge_documents')
     .upsert(payload, { onConflict: 'client_id,source_provider,source_file_id' })
     .select()
@@ -156,7 +172,8 @@ async function upsertKnowledgeDocument(
 }
 
 async function getKnowledgeDocumentBySourceId(clientId, provider, fileId) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_documents')
     .select('*')
     .eq('client_id', clientId)
@@ -167,8 +184,16 @@ async function getKnowledgeDocumentBySourceId(clientId, provider, fileId) {
   return data; // null if not found
 }
 
-async function getKnowledgeDocumentById(documentId) {
-  const { data, error } = await aikbSupabase
+// clientId is required (routing-only, per ADR-008) even though the lookup
+// itself is by id alone — callers are responsible for the client_id
+// ownership check afterward (see routes/knowledge.js and
+// inngest/functions.js#deleteDocument), which deliberately distinguishes
+// "not found" (404) from "belongs to another client" (403/error). Adding a
+// .eq('client_id', clientId) filter here would collapse that distinction
+// and change existing API behavior, so it is intentionally NOT added.
+async function getKnowledgeDocumentById(clientId, documentId) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_documents')
     .select('*')
     .eq('id', documentId)
@@ -178,7 +203,8 @@ async function getKnowledgeDocumentById(documentId) {
 }
 
 async function getDocumentsByClient(clientId) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_documents')
     .select('*')
     .eq('client_id', clientId)
@@ -189,12 +215,13 @@ async function getDocumentsByClient(clientId) {
 }
 
 async function getClientSummaryData(clientId) {
+  const { supabase } = await getAikbDatabase(clientId);
   const [docsRes, chunksRes, jobs, msgs, gapsCount] = await Promise.all([
-    aikbSupabase
+    supabase
       .from('knowledge_documents')
       .select('status, last_indexed_at')
       .eq('client_id', clientId),
-    aikbSupabase
+    supabase
       .from('knowledge_chunks')
       .select('*', { count: 'exact', head: true })
       .eq('client_id', clientId),
@@ -231,16 +258,17 @@ async function getClientSummaryData(clientId) {
 }
 
 async function getClientAnalyticsData(clientId) {
+  const { supabase } = await getAikbDatabase(clientId);
   const [msgs, gapsCount, recentGapsRes, failedJobsRes, jobs] = await Promise.all([
     fetchUserQuestionTimestamps(clientId),
     fetchKnowledgeGapsCount(clientId),
-    aikbSupabase
+    supabase
       .from('knowledge_gaps')
       .select('id, question, reason, status, created_at')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(10),
-    aikbSupabase
+    supabase
       .from('knowledge_ingestion_jobs')
       .select('id, source_file_id, status, error_message, created_at, updated_at')
       .eq('client_id', clientId)
@@ -281,25 +309,26 @@ async function getClientAnalyticsData(clientId) {
 // instead of knowledge_ingestion_jobs up to 4x, knowledge_chat_messages 2x,
 // and knowledge_gaps 2x across three separate HTTP round trips.
 async function getClientKnowledgeStats(clientId) {
+  const { supabase } = await getAikbDatabase(clientId);
   const [docsRes, chunksRes, jobs, msgs, gapsCount, recentGapsRes, failedJobsRes] = await Promise.all([
-    aikbSupabase
+    supabase
       .from('knowledge_documents')
       .select('status, last_indexed_at')
       .eq('client_id', clientId),
-    aikbSupabase
+    supabase
       .from('knowledge_chunks')
       .select('*', { count: 'exact', head: true })
       .eq('client_id', clientId),
     fetchRecentIngestionJobs(clientId, 100),
     fetchUserQuestionTimestamps(clientId),
     fetchKnowledgeGapsCount(clientId),
-    aikbSupabase
+    supabase
       .from('knowledge_gaps')
       .select('id, question, reason, status, created_at')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(10),
-    aikbSupabase
+    supabase
       .from('knowledge_ingestion_jobs')
       .select('id, source_file_id, status, error_message, created_at, updated_at')
       .eq('client_id', clientId)
@@ -349,7 +378,8 @@ async function getClientKnowledgeStats(clientId) {
 }
 
 async function getAllIndexedDocumentSourceIds(clientId, provider) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_documents')
     .select('source_file_id')
     .eq('client_id', clientId)
@@ -360,7 +390,8 @@ async function getAllIndexedDocumentSourceIds(clientId, provider) {
 }
 
 async function getAllIndexedDocuments(clientId, provider) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_documents')
     .select('id, source_file_id, content_hash')
     .eq('client_id', clientId)
@@ -370,32 +401,44 @@ async function getAllIndexedDocuments(clientId, provider) {
   return data;
 }
 
-async function markDocumentIndexed(documentId) {
-  const { error } = await aikbSupabase
+async function markDocumentIndexed(clientId, documentId) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { error } = await supabase
     .from('knowledge_documents')
     .update({ status: 'indexed', last_indexed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
     .eq('id', documentId);
   if (error) throw new Error(`markDocumentIndexed: ${error.message}`);
 }
 
-async function markDocumentDeleted(documentId) {
-  const { error } = await aikbSupabase
+async function markDocumentDeleted(clientId, documentId) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { error } = await supabase
     .from('knowledge_documents')
     .update({ status: 'deleted', updated_at: new Date().toISOString() })
     .eq('id', documentId);
   if (error) throw new Error(`markDocumentDeleted: ${error.message}`);
 }
 
-async function markDocumentError(documentId, errorMessage) {
-  const { error } = await aikbSupabase
+async function markDocumentError(clientId, documentId, errorMessage) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { error } = await supabase
     .from('knowledge_documents')
     .update({ status: 'error', error_message: errorMessage, updated_at: new Date().toISOString() })
     .eq('id', documentId);
   if (error) throw new Error(`markDocumentError: ${error.message}`);
 }
 
+// Cross-client administrative enumeration (not called by any current
+// route — kept for ad hoc/administrative use). Unlike every other function
+// in this file, there is no single clientId to scope this to: it exists
+// specifically to list every client_id present in the shared project. It
+// therefore resolves through getSharedAikbDatabaseForAdminOperation()
+// rather than getAikbDatabase(clientId) — see
+// services/aikbDatabaseProvider.js for why that accessor is kept separate
+// and narrow.
 async function getDistinctClientIds() {
-  const { data, error } = await aikbSupabase
+  const { supabase } = getSharedAikbDatabaseForAdminOperation();
+  const { data, error } = await supabase
     .from('knowledge_documents')
     .select('client_id')
     .neq('status', 'deleted');
@@ -419,7 +462,8 @@ async function getDistinctClientIds() {
 // ---------------------------------------------------------------------------
 
 async function ensureDefaultCollections(clientId) {
-  const { error: upsertError } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { error: upsertError } = await supabase
     .from('knowledge_collections')
     .upsert(
       [
@@ -430,7 +474,7 @@ async function ensureDefaultCollections(clientId) {
     );
   if (upsertError) throw new Error(`ensureDefaultCollections: ${upsertError.message}`);
 
-  const { data, error } = await aikbSupabase
+  const { data, error } = await supabase
     .from('knowledge_collections')
     .select('*')
     .eq('client_id', clientId)
@@ -448,7 +492,8 @@ async function getDefaultCollection(clientId) {
 async function listCollectionsWithCounts(clientId) {
   const collections = await ensureDefaultCollections(clientId);
 
-  const { data: docs, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data: docs, error } = await supabase
     .from('knowledge_documents')
     .select('collection_id')
     .eq('client_id', clientId)
@@ -463,8 +508,14 @@ async function listCollectionsWithCounts(clientId) {
   return collections.map((c) => ({ ...c, documentCount: counts.get(c.id) || 0 }));
 }
 
-async function getCollectionById(collectionId) {
-  const { data, error } = await aikbSupabase
+// clientId is required (routing-only) even though the lookup is by id
+// alone — see getKnowledgeDocumentById's comment above for why no
+// .eq('client_id', clientId) filter is added here: callers check
+// collection.client_id === clientId themselves afterward and rely on the
+// existing 404 (not found) vs 403 (wrong client) distinction.
+async function getCollectionById(clientId, collectionId) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_collections')
     .select('*')
     .eq('id', collectionId)
@@ -474,7 +525,8 @@ async function getCollectionById(collectionId) {
 }
 
 async function createCollection(clientId, name) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_collections')
     .insert({ client_id: clientId, name })
     .select()
@@ -490,8 +542,9 @@ async function createCollection(clientId, name) {
   return data;
 }
 
-async function renameCollection(collectionId, name) {
-  const { data, error } = await aikbSupabase
+async function renameCollection(clientId, collectionId, name) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_collections')
     .update({ name, updated_at: new Date().toISOString() })
     .eq('id', collectionId)
@@ -508,8 +561,9 @@ async function renameCollection(collectionId, name) {
   return data;
 }
 
-async function deleteCollection(collectionId) {
-  const { error } = await aikbSupabase
+async function deleteCollection(clientId, collectionId) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { error } = await supabase
     .from('knowledge_collections')
     .delete()
     .eq('id', collectionId);
@@ -523,8 +577,9 @@ async function deleteCollection(collectionId) {
   }
 }
 
-async function moveDocumentCollection(documentId, collectionId) {
-  const { data, error } = await aikbSupabase
+async function moveDocumentCollection(clientId, documentId, collectionId) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_documents')
     .update({ collection_id: collectionId, updated_at: new Date().toISOString() })
     .eq('id', documentId)
@@ -538,11 +593,12 @@ async function moveDocumentCollection(documentId, collectionId) {
 // Chunks
 // ---------------------------------------------------------------------------
 
-async function deleteChunksForDocument(documentId) {
+async function deleteChunksForDocument(clientId, documentId) {
   console.log(`[deleteChunksForDocument] START | docId=${documentId}`);
   const start = Date.now();
 
-  const deletePromise = aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const deletePromise = supabase
     .from('knowledge_chunks')
     .delete()
     .eq('document_id', documentId)
@@ -567,13 +623,14 @@ async function deleteChunksForDocument(documentId) {
   return data;
 }
 
-async function insertKnowledgeChunks(chunks) {
+async function insertKnowledgeChunks(clientId, chunks) {
   // chunks: [{ document_id, client_id, chunk_index, content, embedding, metadata }]
+  const { supabase } = await getAikbDatabase(clientId);
   // Batch in groups of 500 to stay within Supabase request size limits
   const BATCH = 500;
   for (let i = 0; i < chunks.length; i += BATCH) {
     const batch = chunks.slice(i, i + BATCH);
-    const { error } = await aikbSupabase.from('knowledge_chunks').insert(batch);
+    const { error } = await supabase.from('knowledge_chunks').insert(batch);
     if (error) throw new Error(`insertKnowledgeChunks (batch ${i}): ${error.message}`);
   }
 }
@@ -642,7 +699,8 @@ async function requireActiveClient(clientId) {
 // collections — filtering happens inside that single query, never as an
 // app-layer post-filter, so a restricted chunk is never fetched at all.
 async function searchChunks(clientId, queryEmbedding, { threshold = 0.15, count = 10, allowedCollectionIds = null } = {}) {
-  const { data, error } = await aikbSupabase.rpc('match_knowledge_chunks', {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase.rpc('match_knowledge_chunks', {
     query_embedding: queryEmbedding,
     match_client_id: clientId,
     match_threshold: threshold,
@@ -656,7 +714,8 @@ async function searchChunks(clientId, queryEmbedding, { threshold = 0.15, count 
 // Cheap existence check used to decide whether an "unsupported"-classified query
 // still deserves a retrieval attempt (see routes/knowledge.js /query).
 async function hasIndexedDocuments(clientId) {
-  const { count, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { count, error } = await supabase
     .from('knowledge_documents')
     .select('id', { count: 'exact', head: true })
     .eq('client_id', clientId)
@@ -721,7 +780,8 @@ async function searchChunksWithTitleBoost(clientId, queryEmbedding, question, { 
     return { chunks: vectorMatches, matchedDocumentIds: [] };
   }
 
-  const { data: titleChunks, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data: titleChunks, error } = await supabase
     .from('knowledge_chunks')
     .select('id, document_id, content, metadata')
     .in('document_id', matchedDocumentIds)
@@ -756,7 +816,8 @@ async function searchChunksWithTitleBoost(clientId, queryEmbedding, question, { 
 // services/runKnowledgeQuery.js). Portal sessions keep leaving all three
 // null, unchanged from before this migration.
 async function createChatSession(clientId, title, memberId = null, { origin = null, originMetadata = null, idempotencyKey = null } = {}) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_chat_sessions')
     .insert({
       client_id: clientId,
@@ -781,7 +842,8 @@ async function createChatSession(clientId, title, memberId = null, { origin = nu
 // returns at most one row.
 async function getChatSessionByIdempotencyKey(clientId, idempotencyKey) {
   if (!idempotencyKey) return null;
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_chat_sessions')
     .select('*')
     .eq('client_id', clientId)
@@ -795,7 +857,8 @@ async function getChatSessionByIdempotencyKey(clientId, idempotencyKey) {
 //   - memberId set, not admin → only that member's session
 //   - memberId null (no auth) or isAdmin → any session for the client (backward compat / admin)
 async function getChatSession(clientId, sessionId, memberId = null, isAdmin = false) {
-  let query = aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  let query = supabase
     .from('knowledge_chat_sessions')
     .select('*')
     .eq('id', sessionId)
@@ -824,7 +887,8 @@ async function getChatSession(clientId, sessionId, memberId = null, isAdmin = fa
 // memberId set, not admin → only that member's sessions (existing null-member_id rows hidden).
 // memberId null (no auth) or isAdmin → all non-deleted sessions for the client.
 async function listChatSessions(clientId, memberId = null, isAdmin = false) {
-  let query = aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  let query = supabase
     .from('knowledge_chat_sessions')
     .select('id, title, created_at, updated_at, member_id')
     .eq('client_id', clientId)
@@ -847,7 +911,8 @@ async function listChatSessions(clientId, memberId = null, isAdmin = false) {
 // memberId set, not admin → scope the UPDATE to prevent a member from renaming another's session.
 // (getChatSession ownership check runs before this in the route, so this is defense in depth.)
 async function updateChatSessionTitle(clientId, sessionId, title, memberId = null, isAdmin = false) {
-  let query = aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  let query = supabase
     .from('knowledge_chat_sessions')
     .update({ title, updated_at: new Date().toISOString() })
     .eq('id', sessionId)
@@ -867,9 +932,10 @@ async function updateChatSessionTitle(clientId, sessionId, title, memberId = nul
 // getChatSession ownership check should have already run before this).
 // memberId null or isAdmin → delete by client + session only.
 async function softDeleteChatSession(clientId, sessionId, memberId = null, isAdmin = false) {
+  const { supabase } = await getAikbDatabase(clientId);
   const now = new Date().toISOString();
 
-  let sessionQuery = aikbSupabase
+  let sessionQuery = supabase
     .from('knowledge_chat_sessions')
     .update({ deleted_at: now, updated_at: now })
     .eq('id', sessionId)
@@ -884,7 +950,7 @@ async function softDeleteChatSession(clientId, sessionId, memberId = null, isAdm
 
   // Messages are always scoped by session_id + client_id.
   // Ownership of the session was already validated above.
-  const { error: msgError } = await aikbSupabase
+  const { error: msgError } = await supabase
     .from('knowledge_chat_messages')
     .update({ deleted_at: now })
     .eq('session_id', sessionId)
@@ -895,9 +961,10 @@ async function softDeleteChatSession(clientId, sessionId, memberId = null, isAdm
 // memberId set, not admin → only soft-delete sessions (and messages) owned by that member.
 // memberId null (no auth) or isAdmin → soft-delete all history for the client.
 async function softDeleteAllChatHistory(clientId, memberId = null, isAdmin = false) {
+  const { supabase } = await getAikbDatabase(clientId);
   const now = new Date().toISOString();
 
-  let sessionQuery = aikbSupabase
+  let sessionQuery = supabase
     .from('knowledge_chat_sessions')
     .update({ deleted_at: now, updated_at: now })
     .eq('client_id', clientId)
@@ -910,7 +977,7 @@ async function softDeleteAllChatHistory(clientId, memberId = null, isAdmin = fal
   const { error: sessionError } = await sessionQuery;
   if (sessionError) throw new Error(`softDeleteAllChatHistory (sessions): ${sessionError.message}`);
 
-  let msgQuery = aikbSupabase
+  let msgQuery = supabase
     .from('knowledge_chat_messages')
     .update({ deleted_at: now })
     .eq('client_id', clientId)
@@ -950,14 +1017,16 @@ async function redactChatSessionByIdempotencyKey(clientId, idempotencyKey) {
     return { redacted: false, reason: 'not_found' };
   }
 
-  const { error: sessionError } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+
+  const { error: sessionError } = await supabase
     .from('knowledge_chat_sessions')
     .update({ title: null, updated_at: new Date().toISOString() })
     .eq('id', session.id)
     .eq('client_id', clientId);
   if (sessionError) throw new Error(`redactChatSessionByIdempotencyKey (session): ${sessionError.message}`);
 
-  const { error: messagesError } = await aikbSupabase
+  const { error: messagesError } = await supabase
     .from('knowledge_chat_messages')
     .update({ content: REDACTED_MESSAGE_CONTENT, sources: null, metadata: null })
     .eq('session_id', session.id)
@@ -974,7 +1043,8 @@ async function redactChatSessionByIdempotencyKey(clientId, idempotencyKey) {
 // member_id is denormalised here (same as client_id) for fast member-scoped queries
 // without joining knowledge_chat_sessions. References Relativity_Global.client_members.id.
 async function createChatMessage({ clientId, sessionId, role, content, sources = null, metadata = null, memberId = null }) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_chat_messages')
     .insert({ client_id: clientId, session_id: sessionId, role, content, sources, metadata, member_id: memberId })
     .select()
@@ -982,7 +1052,7 @@ async function createChatMessage({ clientId, sessionId, role, content, sources =
   if (error) throw new Error(`createChatMessage: ${error.message}`);
 
   // Keep the parent session's updated_at current so list ordering reflects activity
-  const { error: sessionError } = await aikbSupabase
+  const { error: sessionError } = await supabase
     .from('knowledge_chat_sessions')
     .update({ updated_at: new Date().toISOString() })
     .eq('id', sessionId)
@@ -993,7 +1063,8 @@ async function createChatMessage({ clientId, sessionId, role, content, sources =
 }
 
 async function listChatMessages(clientId, sessionId) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_chat_messages')
     .select('*')
     .eq('client_id', clientId)
@@ -1008,7 +1079,8 @@ async function listChatMessages(clientId, sessionId) {
 // oldest-first. Used to give the intent classifier/retrieval query builder
 // short-term conversation context without loading full session history.
 async function listRecentChatMessages(clientId, sessionId, limit = 8) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_chat_messages')
     .select('id, role, content, created_at')
     .eq('client_id', clientId)
@@ -1033,8 +1105,9 @@ async function listRecentChatMessages(clientId, sessionId, limit = 8) {
 
 const SLACK_REQUEST_UNIQUE_VIOLATION = '23505';
 
-async function getSlackRequestByIdempotencyKey(idempotencyKey) {
-  const { data, error } = await aikbSupabase
+async function getSlackRequestByIdempotencyKey(clientId, idempotencyKey) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_slack_request_log')
     .select('*')
     .eq('idempotency_key', idempotencyKey)
@@ -1053,7 +1126,8 @@ async function getSlackRequestByIdempotencyKey(idempotencyKey) {
 // are visible operationally, but no second Inngest event/LLM call/Slack
 // reply is ever triggered.
 async function claimSlackRequest({ clientId, idempotencyKey, origin }) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_slack_request_log')
     .insert({ client_id: clientId, idempotency_key: idempotencyKey, origin })
     .select()
@@ -1062,9 +1136,9 @@ async function claimSlackRequest({ clientId, idempotencyKey, origin }) {
   if (!error) return { claimed: true, row: data };
 
   if (error.code === SLACK_REQUEST_UNIQUE_VIOLATION) {
-    const existing = await getSlackRequestByIdempotencyKey(idempotencyKey);
+    const existing = await getSlackRequestByIdempotencyKey(clientId, idempotencyKey);
     if (!existing) return { claimed: false, row: null };
-    const { data: bumped, error: bumpErr } = await aikbSupabase
+    const { data: bumped, error: bumpErr } = await supabase
       .from('knowledge_slack_request_log')
       .update({ attempt_count: existing.attempt_count + 1, updated_at: new Date().toISOString() })
       .eq('id', existing.id)
@@ -1077,8 +1151,9 @@ async function claimSlackRequest({ clientId, idempotencyKey, origin }) {
   throw new Error(`claimSlackRequest: ${error.message}`);
 }
 
-async function markSlackRequestDelivered(idempotencyKey) {
-  const { data, error } = await aikbSupabase
+async function markSlackRequestDelivered(clientId, idempotencyKey) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_slack_request_log')
     .update({ status: 'delivered', updated_at: new Date().toISOString() })
     .eq('idempotency_key', idempotencyKey)
@@ -1090,8 +1165,9 @@ async function markSlackRequestDelivered(idempotencyKey) {
 
 // errorCategory must be a safe, internal string constant only (e.g.
 // 'AIKB_PROCESSING_FAILED') — never a raw error message or stack trace.
-async function markSlackRequestFailed(idempotencyKey, errorCategory) {
-  const { data, error } = await aikbSupabase
+async function markSlackRequestFailed(clientId, idempotencyKey, errorCategory) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_slack_request_log')
     .update({
       status: 'failed',
@@ -1110,7 +1186,8 @@ async function markSlackRequestFailed(idempotencyKey, errorCategory) {
 // ---------------------------------------------------------------------------
 
 async function getIndexedDocumentByContentHash(clientId, provider, contentHash, excludeSourceFileId) {
-  const { data, error } = await aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_documents')
     .select('id, source_file_id')
     .eq('client_id', clientId)
@@ -1143,6 +1220,7 @@ async function createKnowledgeGap({
   memberId = null, origin = null, originMetadata = null,
   idempotencyKey = null, reportedBy = 'system',
 }) {
+  const { supabase } = await getAikbDatabase(clientId);
   const row = {
     client_id: clientId, session_id: sessionId, message_id: messageId,
     question, reason, member_id: memberId,
@@ -1151,19 +1229,19 @@ async function createKnowledgeGap({
   };
 
   if (!idempotencyKey) {
-    const { data, error } = await aikbSupabase.from('knowledge_gaps').insert(row).select().single();
+    const { data, error } = await supabase.from('knowledge_gaps').insert(row).select().single();
     if (error) throw new Error(`createKnowledgeGap: ${error.message}`);
     return data;
   }
 
-  const { data: inserted, error: insertErr } = await aikbSupabase
+  const { data: inserted, error: insertErr } = await supabase
     .from('knowledge_gaps')
     .upsert(row, { onConflict: 'idempotency_key', ignoreDuplicates: true })
     .select();
   if (insertErr) throw new Error(`createKnowledgeGap: ${insertErr.message}`);
   if (inserted && inserted.length) return inserted[0];
 
-  const { data: updated, error: updateErr } = await aikbSupabase
+  const { data: updated, error: updateErr } = await supabase
     .from('knowledge_gaps')
     .update({ reason, session_id: sessionId, message_id: messageId, updated_at: new Date().toISOString() })
     .eq('idempotency_key', idempotencyKey)
@@ -1178,7 +1256,8 @@ async function createKnowledgeGap({
 // CHECK constraint). Mirrors listCollectionsWithCounts/getCollectionById's
 // shape for the equivalent per-client-list / by-id-lookup pair.
 async function listKnowledgeGapsByClient(clientId, { status = null } = {}) {
-  let query = aikbSupabase
+  const { supabase } = await getAikbDatabase(clientId);
+  let query = supabase
     .from('knowledge_gaps')
     .select('*')
     .eq('client_id', clientId)
@@ -1190,14 +1269,20 @@ async function listKnowledgeGapsByClient(clientId, { status = null } = {}) {
   return data || [];
 }
 
-async function getKnowledgeGapById(id) {
-  const { data, error } = await aikbSupabase.from('knowledge_gaps').select('*').eq('id', id).maybeSingle();
+// clientId is required (routing-only) — see getKnowledgeDocumentById's
+// comment above for why no .eq('client_id', clientId) filter is added: the
+// caller checks gap.client_id === clientId itself afterward, preserving the
+// existing 404 vs 403 distinction.
+async function getKnowledgeGapById(clientId, id) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase.from('knowledge_gaps').select('*').eq('id', id).maybeSingle();
   if (error) throw new Error(`getKnowledgeGapById: ${error.message}`);
   return data || null;
 }
 
-async function updateKnowledgeGapStatus(id, status) {
-  const { data, error } = await aikbSupabase
+async function updateKnowledgeGapStatus(clientId, id, status) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
     .from('knowledge_gaps')
     .update({ status, updated_at: new Date().toISOString() })
     .eq('id', id)
@@ -1216,13 +1301,13 @@ async function updateKnowledgeGapStatus(id, status) {
 // ---------------------------------------------------------------------------
 
 async function deleteStorageForClient(clientId) {
-  const bucket = config.storage.bucket;
+  const { supabase, storageBucket } = await getAikbDatabase(clientId);
   const prefix = `uploads/${clientId}`;
   const limit = 1000;
   let offset = 0;
   const names = [];
   while (true) {
-    const { data, error } = await aikbSupabase.storage.from(bucket).list(prefix, { limit, offset });
+    const { data, error } = await supabase.storage.from(storageBucket).list(prefix, { limit, offset });
     if (error) {
       console.warn(`[deleteStorageForClient] list failed for ${prefix}: ${error.message}`);
       return { removed: 0, errors: [error.message] };
@@ -1239,7 +1324,7 @@ async function deleteStorageForClient(clientId) {
   let removed = 0;
   for (let i = 0; i < paths.length; i += 1000) {
     const batch = paths.slice(i, i + 1000);
-    const { data, error } = await aikbSupabase.storage.from(bucket).remove(batch);
+    const { data, error } = await supabase.storage.from(storageBucket).remove(batch);
     if (error) {
       console.warn(`[deleteStorageForClient] remove batch failed: ${error.message}`);
       errors.push(error.message);
@@ -1258,6 +1343,8 @@ async function deleteAllClientData(clientId) {
   errors.push(...storage.errors.map((e) => `storage: ${e}`));
   console.log(`[deleteAllClientData] storage removed=${storage.removed} errors=${storage.errors.length}`);
 
+  const { supabase } = await getAikbDatabase(clientId);
+
   // Children before parents — defensive given the live schema may drift
   // from this repo's tracked migrations; don't rely solely on cascade.
   const tables = [
@@ -1274,7 +1361,7 @@ async function deleteAllClientData(clientId) {
   ];
   const tableResults = {};
   for (const table of tables) {
-    const { error, count } = await aikbSupabase.from(table).delete({ count: 'exact' }).eq('client_id', clientId);
+    const { error, count } = await supabase.from(table).delete({ count: 'exact' }).eq('client_id', clientId);
     if (error) {
       console.error(`[deleteAllClientData] ${table} delete failed: ${error.message}`);
       errors.push(`${table}: ${error.message}`);

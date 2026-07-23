@@ -66,6 +66,7 @@ function loadSupabaseServiceWithFakeClient(store) {
   };
 
   delete require.cache[require.resolve('../config')];
+  delete require.cache[require.resolve('../services/aikbDatabaseProvider')];
   delete require.cache[require.resolve('../services/supabaseService')];
   const supabaseService = require('../services/supabaseService');
 
@@ -75,6 +76,7 @@ function loadSupabaseServiceWithFakeClient(store) {
       if (previous) require.cache[supabaseJsPath] = previous;
       else delete require.cache[supabaseJsPath];
       delete require.cache[require.resolve('../config')];
+      delete require.cache[require.resolve('../services/aikbDatabaseProvider')];
       delete require.cache[require.resolve('../services/supabaseService')];
     },
   };
