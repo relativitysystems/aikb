@@ -51,7 +51,7 @@ function sanitizeJobError(msg) {
 
 // ---------------------------------------------------------------------------
 // POST /api/knowledge/ingest
-// Trigger ingestion of a single document (portal upload only).
+// Trigger ingestion of a single document.
 // Backlog H4: requireServiceRequest ADDITIVE to the router-level
 // requireApiKey above — clientId/idempotencyKey come ONLY from the verified
 // envelope (req.serviceRequest), never from the request body directly. The
@@ -59,8 +59,18 @@ function sanitizeJobError(msg) {
 // alone can no longer be used to act on an arbitrary client through this
 // route — see middleware/serviceRequest.js and POST /ask above for the
 // established pattern this mirrors.
-// Payload (req.servicePayload): { sourceFileId, fileName, mimeType, storagePath, sourceProvider? }
+//
+// EM6 (Architecture/architecture/EMAIL_INGESTION.md §14.2): sourceProvider
+// allow-list widened from {'portal_upload'} to also accept 'gmail'/
+// 'microsoft' — Relativity's email sync forwards already-normalized plain
+// text through this SAME route, not a parallel ingestion system (§14.2's
+// explicit "no new AIKB route is created for ingestion" constraint).
+// collectionId/emailMetadata are both new, fully optional fields, additive
+// and backward-compatible with every existing (portal_upload) caller.
+// Payload (req.servicePayload): { sourceFileId, fileName, mimeType, storagePath, sourceProvider?, collectionId?, emailMetadata? }
 // ---------------------------------------------------------------------------
+
+const INGEST_SOURCE_PROVIDERS = ['portal_upload', 'gmail', 'microsoft'];
 
 router.post('/ingest', requireServiceRequest, async (req, res, next) => {
   try {
@@ -69,23 +79,32 @@ router.post('/ingest', requireServiceRequest, async (req, res, next) => {
       sourceFileId, fileName, mimeType,
       sourceProvider = 'portal_upload',
       storagePath,
+      collectionId,
+      emailMetadata,
     } = req.servicePayload || {};
 
     if (!sourceFileId || !fileName || !mimeType) {
       return res.status(400).json({ error: 'sourceFileId, fileName, and mimeType are required' });
     }
-    if (sourceProvider !== 'portal_upload') {
-      return res.status(400).json({ error: 'Unsupported sourceProvider. This backend currently supports portal_upload only.' });
+    if (!INGEST_SOURCE_PROVIDERS.includes(sourceProvider)) {
+      return res.status(400).json({ error: `Unsupported sourceProvider. This backend currently supports ${INGEST_SOURCE_PROVIDERS.join(', ')}.` });
     }
     if (!storagePath) {
       return res.status(400).json({ error: 'storagePath is required' });
+    }
+    if (['gmail', 'microsoft'].includes(sourceProvider) && (!emailMetadata || typeof emailMetadata !== 'object')) {
+      return res.status(400).json({ error: 'emailMetadata is required when sourceProvider is gmail or microsoft' });
     }
 
     await supabaseService.requireActiveClient(clientId);
 
     const event = await inngest.send({
       name: 'knowledge/document.ingest',
-      data: { clientId, sourceProvider, sourceFileId, fileName, mimeType, storagePath },
+      data: {
+        clientId, sourceProvider, sourceFileId, fileName, mimeType, storagePath,
+        collectionId: typeof collectionId === 'string' && collectionId ? collectionId : null,
+        emailMetadata: emailMetadata && typeof emailMetadata === 'object' ? emailMetadata : null,
+      },
     });
 
     res.json({ queued: true, eventId: event.ids?.[0] || event.id || null });

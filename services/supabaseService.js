@@ -1202,6 +1202,60 @@ async function getIndexedDocumentByContentHash(clientId, provider, contentHash, 
 }
 
 // ---------------------------------------------------------------------------
+// Email source messages (EM6 — EMAIL_INGESTION.md §13.2, §14.2)
+// ---------------------------------------------------------------------------
+
+// Upserted, not inserted: a re-sync of an already-ingested message (unique on
+// document_id, itself unique per client/source_provider/source_file_id) may
+// legitimately need to refresh label/folder metadata even when the body's
+// content hash is unchanged elsewhere — see inngest/functions.js's caller,
+// which only reaches this on a true first-insert/content-changed ingest.
+async function upsertEmailSourceMessage(clientId, documentId, emailMetadata, contentHash) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const {
+    provider, providerAccountId, contributingMemberId, providerMessageId, providerThreadId,
+    from, fromName, to, cc, subject, sentAt, receivedAt, folderOrLabels, hasAttachments,
+    deepLinkUrl, ingestionRuleId,
+  } = emailMetadata || {};
+
+  if (!provider || !providerAccountId || !providerMessageId) {
+    throw new Error('upsertEmailSourceMessage requires emailMetadata.provider, providerAccountId, and providerMessageId');
+  }
+
+  const { data, error } = await supabase
+    .from('email_source_messages')
+    .upsert(
+      {
+        document_id: documentId,
+        client_id: clientId,
+        provider,
+        provider_account_id: providerAccountId,
+        contributing_member_id: contributingMemberId || null,
+        provider_message_id: providerMessageId,
+        provider_thread_id: providerThreadId || null,
+        from_address: from || null,
+        from_name: fromName || null,
+        to_addresses: Array.isArray(to) ? to : [],
+        cc_addresses: Array.isArray(cc) ? cc : [],
+        subject: subject || null,
+        sent_at: sentAt || null,
+        received_at: receivedAt || null,
+        folder_or_labels: Array.isArray(folderOrLabels) ? folderOrLabels : [],
+        has_attachments: !!hasAttachments,
+        deep_link_url: deepLinkUrl || null,
+        ingestion_rule_id: ingestionRuleId || null,
+        content_hash: contentHash || null,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'document_id' }
+    )
+    .select('*')
+    .maybeSingle();
+  if (error) throw new Error(`upsertEmailSourceMessage: ${error.message}`);
+  return data;
+}
+
+// ---------------------------------------------------------------------------
 // Knowledge gaps
 // ---------------------------------------------------------------------------
 
@@ -1431,6 +1485,7 @@ module.exports = {
   markSlackRequestDelivered,
   markSlackRequestFailed,
   getIndexedDocumentByContentHash,
+  upsertEmailSourceMessage,
   getClientSummaryData,
   getClientAnalyticsData,
   getClientKnowledgeStats,

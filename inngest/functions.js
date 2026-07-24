@@ -66,6 +66,12 @@ const ingestDocument = inngest.createFunction(
       mimeType,
       forceReindex = false,
       storagePath,
+      // EM6 (EMAIL_INGESTION.md §14.2) — both optional, null for every
+      // existing portal_upload caller. collectionId overrides the "always
+      // assign the client's default collection at first insert" behavior;
+      // emailMetadata is present only when sourceProvider is gmail/microsoft.
+      collectionId = null,
+      emailMetadata = null,
     } = event.data;
 
     if (!clientId) throw new Error('clientId is required');
@@ -73,9 +79,10 @@ const ingestDocument = inngest.createFunction(
     if (!fileName) throw new Error('fileName is required');
     if (!mimeType) throw new Error('mimeType is required');
     if (!storagePath) throw new Error('storagePath is required');
-    if (sourceProvider !== 'portal_upload') {
-      throw new Error('Unsupported sourceProvider. This backend currently supports portal_upload only.');
+    if (!['portal_upload', 'gmail', 'microsoft'].includes(sourceProvider)) {
+      throw new Error('Unsupported sourceProvider. This backend currently supports portal_upload, gmail, and microsoft.');
     }
+    const isEmailSource = sourceProvider === 'gmail' || sourceProvider === 'microsoft';
 
     let jobId = null;
     let documentId = null;
@@ -148,8 +155,14 @@ const ingestDocument = inngest.createFunction(
             return { skipped: true, reason: 'content hash unchanged', documentId: existing.id, chunkCount: 0, pageCount, contentHash };
           }
 
-          // Cross-file duplicate content check
-          if (!forceReindex) {
+          // Cross-file duplicate content check — disabled for email
+          // (EMAIL_INGESTION.md §20): two distinct, legitimately separate
+          // emails (templated auto-notifications, boilerplate replies) can
+          // share a near-identical body and must not collapse into one
+          // indexed document the way two uploads of the same file should.
+          // The same-file, unchanged-content skip above (existing.content_hash)
+          // is unaffected and remains correct for email.
+          if (!forceReindex && !isEmailSource) {
             const contentDuplicate = await supabaseService.getIndexedDocumentByContentHash(
               clientId, sourceProvider, contentHash, sourceFileId
             );
@@ -164,11 +177,12 @@ const ingestDocument = inngest.createFunction(
           // a true first-insert (existing is falsy here) — a reindex of an
           // already-moved document must never reset its collection back to
           // General (see upsertKnowledgeDocument's "only write when truthy"
-          // handling of this param).
+          // handling of this param). EM6: an explicit collectionId from the
+          // caller (a matched email_ingestion_rules.destination_collection_id,
+          // §22) takes priority over the default collection.
           let newDocCollectionId;
           if (!existing) {
-            const defaultCollection = await supabaseService.getDefaultCollection(clientId);
-            newDocCollectionId = defaultCollection.id;
+            newDocCollectionId = collectionId || (await supabaseService.getDefaultCollection(clientId)).id;
           }
           const doc = await supabaseService.upsertKnowledgeDocument(
             clientId, sourceProvider, sourceFileId, fileName, resolvedMimeType, contentHash,
@@ -270,6 +284,21 @@ const ingestDocument = inngest.createFunction(
         await supabaseService.markDocumentIndexed(clientId, documentId);
       });
       console.log(`[ingest] END   mark-indexed | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t5}ms`);
+
+      // -- Step 5b (EM6, email only): write email_source_messages ------------
+      // Additive, after mark-indexed — never blocks or replaces any existing
+      // step (EMAIL_INGESTION.md §14.2). Only runs for a true first-insert/
+      // content-changed ingest (the unchanged-hash skip path above returns
+      // before this point); re-syncing an unchanged message intentionally
+      // leaves its existing email_source_messages row as-is.
+      if (isEmailSource && emailMetadata) {
+        console.log(`[ingest] START write-email-source-message | ${tag(jobId, sourceFileId, documentId)}`);
+        const t5b = Date.now();
+        await step.run('write-email-source-message', async () => {
+          await supabaseService.upsertEmailSourceMessage(clientId, documentId, emailMetadata, coreResult.contentHash);
+        });
+        console.log(`[ingest] END   write-email-source-message | ${tag(jobId, sourceFileId, documentId)} | elapsed=${Date.now() - t5b}ms`);
+      }
 
       // -- Step 6: Complete job -----------------------------------------------
       console.log(`[ingest] START complete-job | ${tag(jobId, sourceFileId, documentId)}`);
