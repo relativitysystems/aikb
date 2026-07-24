@@ -50,7 +50,7 @@ const ingestDocument = inngest.createFunction(
     id: 'knowledge-document-ingest',
     name: 'Ingest Knowledge Document',
     concurrency: { limit: 2, key: 'event.data.clientId' },
-    retries: 3,
+    retries: config.inngest.defaultRetries,
     onFailure: async ({ event, error }) => {
       // Backup log — primary error logging is handled via try/catch inside the function
       console.error('[ingest] onFailure', { error: error.message });
@@ -334,7 +334,7 @@ const deleteDocument = inngest.createFunction(
   {
     id: 'knowledge-document-delete',
     name: 'Delete Knowledge Document',
-    retries: 3,
+    retries: config.inngest.defaultRetries,
   },
   { event: 'knowledge/document.delete' },
   async ({ event, step }) => {
@@ -393,7 +393,7 @@ const reindexDocument = inngest.createFunction(
   {
     id: 'knowledge-document-reindex',
     name: 'Reindex Knowledge Document',
-    retries: 3,
+    retries: config.inngest.defaultRetries,
   },
   { event: 'knowledge/document.reindex' },
   async ({ event, step }) => {
@@ -466,7 +466,7 @@ const slackQuestionRequested = inngest.createFunction(
     id: 'knowledge-slack-question-requested',
     name: 'Answer Slack Question',
     concurrency: { limit: 5, key: 'event.data.clientId' },
-    retries: 3,
+    retries: config.inngest.defaultRetries,
     onFailure: async ({ event, error }) => {
       // Inngest's own retries are exhausted — this is the "AIKB generation
       // failure" path (ADR-007, Relativity's Architecture repo): tell

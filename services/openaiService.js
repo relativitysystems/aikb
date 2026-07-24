@@ -158,7 +158,7 @@ async function generateRagAnswer(question, contextChunks, sessionMessages = []) 
   ];
 
   const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
+    model: config.openai.chatModel,
     messages: [{ role: 'system', content: RAG_SYSTEM_PROMPT }, ...messages],
     temperature: 0.2,
   });
@@ -171,7 +171,7 @@ async function generateRagAnswer(question, contextChunks, sessionMessages = []) 
  */
 async function generateChatCompletion(messages, systemPrompt) {
   const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
+    model: config.openai.chatModel,
     messages: [{ role: 'system', content: systemPrompt || RAG_SYSTEM_PROMPT }, ...messages],
     temperature: 0.2,
   });
@@ -360,7 +360,7 @@ async function classifyQueryIntent(question, sessionMessages = []) {
       : trimmed;
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: config.openai.lightweightModel,
       messages: [
         { role: 'system', content: INTENT_CLASSIFIER_PROMPT },
         { role: 'user', content: userContent },
@@ -430,7 +430,7 @@ async function buildRetrievalQuery(question, sessionMessages = []) {
   try {
     const contextBlock = formatSessionContext(sessionMessages);
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: config.openai.lightweightModel,
       messages: [
         { role: 'system', content: RETRIEVAL_QUERY_REWRITE_PROMPT },
         {

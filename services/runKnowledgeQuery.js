@@ -43,6 +43,7 @@
 // on every question). Product decision: still store the real question text
 // on a detected gap, for both origins, unchanged by this milestone.
 
+const config = require('../config');
 const defaultSupabaseService = require('./supabaseService');
 const defaultOpenaiService = require('./openaiService');
 const { buildGapIdempotencyKey } = require('./knowledgeGapKey');
@@ -210,7 +211,7 @@ async function runKnowledgeQuery({
     // classified/retrieved using the actual prior conversation. For Slack,
     // this session is brand new, so this is always empty — no conversation
     // memory across separate app_mention events, per §4.12.
-    const recentMessages = await supabaseService.listRecentChatMessages(clientId, sessionId, 8);
+    const recentMessages = await supabaseService.listRecentChatMessages(clientId, sessionId, config.pagination.chatContextMessageLimit);
     recentSessionMessages = recentMessages
       .filter((m) => m.id !== userMsg.id)
       .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));

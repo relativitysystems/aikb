@@ -12,10 +12,11 @@
 // deployment would need a shared store (e.g. Redis) instead.
 
 const rateLimit = require('express-rate-limit');
+const config = require('../config');
 
 const knowledgeApiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 2000,
+  windowMs: config.rateLimit.knowledgeApi.windowMs,
+  limit: config.rateLimit.knowledgeApi.max,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests. Please try again later.' },

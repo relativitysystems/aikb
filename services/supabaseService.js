@@ -99,7 +99,7 @@ async function logIngestionError(clientId, jobId, documentId, err) {
 // same query independently. Centralizing them here means a caller that needs
 // more than one of these (see getClientKnowledgeStats) only pays for each
 // underlying table once.
-async function fetchRecentIngestionJobs(clientId, limit = 100) {
+async function fetchRecentIngestionJobs(clientId, limit = config.pagination.recentIngestionJobsLimit) {
   const { supabase } = await getAikbDatabase(clientId);
   const { data, error } = await supabase
     .from('knowledge_ingestion_jobs')
@@ -134,7 +134,7 @@ async function fetchKnowledgeGapsCount(clientId) {
 }
 
 async function getIngestionJobsByClient(clientId) {
-  return fetchRecentIngestionJobs(clientId, 100);
+  return fetchRecentIngestionJobs(clientId, config.pagination.recentIngestionJobsLimit);
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +225,7 @@ async function getClientSummaryData(clientId) {
       .from('knowledge_chunks')
       .select('*', { count: 'exact', head: true })
       .eq('client_id', clientId),
-    fetchRecentIngestionJobs(clientId, 100),
+    fetchRecentIngestionJobs(clientId, config.pagination.recentIngestionJobsLimit),
     fetchUserQuestionTimestamps(clientId),
     fetchKnowledgeGapsCount(clientId),
   ]);
@@ -267,15 +267,15 @@ async function getClientAnalyticsData(clientId) {
       .select('id, question, reason, status, created_at')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
-      .limit(10),
+      .limit(config.pagination.recentActivityLimit),
     supabase
       .from('knowledge_ingestion_jobs')
       .select('id, source_file_id, status, error_message, created_at, updated_at')
       .eq('client_id', clientId)
       .eq('status', 'failed')
       .order('created_at', { ascending: false })
-      .limit(10),
-    fetchRecentIngestionJobs(clientId, 100),
+      .limit(config.pagination.recentActivityLimit),
+    fetchRecentIngestionJobs(clientId, config.pagination.recentIngestionJobsLimit),
   ]);
 
   if (recentGapsRes.error) throw new Error(`getClientAnalyticsData (recent gaps): ${recentGapsRes.error.message}`);
@@ -286,12 +286,13 @@ async function getClientAnalyticsData(clientId) {
     totalKnowledgeGaps: gapsCount,
     recentKnowledgeGaps: recentGapsRes.data ?? [],
     failedIngestionJobs: failedJobsRes.data ?? [],
-    // Top 10 of the same 100-row window fetched above — behaviorally
-    // identical to a direct "ORDER BY created_at DESC LIMIT 10" query since
-    // 10 <= 100, just without a second round trip. Projected down to this
-    // endpoint's original (narrower) column set.
+    // Top recentActivityLimit rows of the same recentIngestionJobsLimit-row
+    // window fetched above — behaviorally identical to a direct "ORDER BY
+    // created_at DESC LIMIT recentActivityLimit" query (recentActivityLimit
+    // <= recentIngestionJobsLimit), just without a second round trip.
+    // Projected down to this endpoint's original (narrower) column set.
     recentIngestionActivity: jobs
-      .slice(0, 10)
+      .slice(0, config.pagination.recentActivityLimit)
       .map(({ id, source_file_id, status, created_at, updated_at }) => ({
         id,
         source_file_id,
@@ -319,7 +320,7 @@ async function getClientKnowledgeStats(clientId) {
       .from('knowledge_chunks')
       .select('*', { count: 'exact', head: true })
       .eq('client_id', clientId),
-    fetchRecentIngestionJobs(clientId, 100),
+    fetchRecentIngestionJobs(clientId, config.pagination.recentIngestionJobsLimit),
     fetchUserQuestionTimestamps(clientId),
     fetchKnowledgeGapsCount(clientId),
     supabase
@@ -327,14 +328,14 @@ async function getClientKnowledgeStats(clientId) {
       .select('id, question, reason, status, created_at')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
-      .limit(10),
+      .limit(config.pagination.recentActivityLimit),
     supabase
       .from('knowledge_ingestion_jobs')
       .select('id, source_file_id, status, error_message, created_at, updated_at')
       .eq('client_id', clientId)
       .eq('status', 'failed')
       .order('created_at', { ascending: false })
-      .limit(10),
+      .limit(config.pagination.recentActivityLimit),
   ]);
 
   if (docsRes.error) throw new Error(`getClientKnowledgeStats (docs): ${docsRes.error.message}`);
@@ -1078,7 +1079,7 @@ async function listChatMessages(clientId, sessionId) {
 // Fetches the most recent `limit` non-deleted messages for a session, returned
 // oldest-first. Used to give the intent classifier/retrieval query builder
 // short-term conversation context without loading full session history.
-async function listRecentChatMessages(clientId, sessionId, limit = 8) {
+async function listRecentChatMessages(clientId, sessionId, limit = config.pagination.chatContextMessageLimit) {
   const { supabase } = await getAikbDatabase(clientId);
   const { data, error } = await supabase
     .from('knowledge_chat_messages')
@@ -1316,7 +1317,7 @@ async function listKnowledgeGapsByClient(clientId, { status = null } = {}) {
     .select('*')
     .eq('client_id', clientId)
     .order('created_at', { ascending: false })
-    .limit(200);
+    .limit(config.pagination.knowledgeGapsListLimit);
   if (status) query = query.eq('status', status);
   const { data, error } = await query;
   if (error) throw new Error(`listKnowledgeGapsByClient: ${error.message}`);

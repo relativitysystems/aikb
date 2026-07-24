@@ -45,7 +45,7 @@ async function listFolderFiles(folderId) {
     const res = await drive.files.list({
       q: `'${folderId}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'`,
       fields: 'nextPageToken, files(id, name, mimeType, md5Checksum, modifiedTime)',
-      pageSize: 200,
+      pageSize: config.googleDrive.pageSize,
       pageToken: pageToken || undefined,
     });
     files.push(...(res.data.files || []));
