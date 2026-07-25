@@ -104,13 +104,26 @@ const config = {
   serviceRequest: {
     signingSecret: process.env.SERVICE_REQUEST_SIGNING_SECRET,
   },
-  // Relativity's base URL, used only to call back
-  // POST /api/integrations/slack/deliver once a Slack-originated question
-  // has an answer (services/relativityDeliverClient.js). AIKB never calls
-  // any other Relativity route.
+  // Relativity's base URL. Called back for two routes: POST
+  // /api/integrations/slack/deliver once a Slack-originated question has an
+  // answer (services/relativityDeliverClient.js), and, as of EM8, POST
+  // /api/integrations/email/sync/tick on a cron interval
+  // (services/relativityTickClient.js, EMAIL_INGESTION.md §18.3) — AIKB
+  // calls no other Relativity route.
   relativity: {
     apiBaseUrl: process.env.RELATIVITY_API_BASE_URL,
     deliverTimeoutMs: parseInt(process.env.RELATIVITY_DELIVER_TIMEOUT_MS || '8000', 10),
+    // EM8 — separate timeout from deliverTimeoutMs since the tick call has
+    // a different, unrelated caller (a cron function, not a Slack question
+    // request) and may need independent tuning as the fan-out logic on the
+    // Relativity side grows.
+    tickTimeoutMs: parseInt(process.env.RELATIVITY_TICK_TIMEOUT_MS || '15000', 10),
+  },
+  // EM8 (§18.3) — the automatic-sync scheduler's own cron cadence. Should
+  // roughly match Relativity's EMAIL_SYNC_TICK_INTERVAL_MS (documented, not
+  // enforced across the two repos/config systems).
+  emailSync: {
+    tickCronSchedule: process.env.EMAIL_SYNC_TICK_CRON_SCHEDULE || '*/20 * * * *',
   },
 };
 

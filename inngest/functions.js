@@ -9,6 +9,7 @@ const documentParser = require('../services/documentParser');
 const chunkService = require('../services/chunkService');
 const { runKnowledgeQuery } = require('../services/runKnowledgeQuery');
 const relativityDeliverClient = require('../services/relativityDeliverClient');
+const relativityTickClient = require('../services/relativityTickClient');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -554,6 +555,42 @@ const slackQuestionRequested = inngest.createFunction(
   }
 );
 
-const functions = [ingestDocument, deleteDocument, reindexDocument, slackQuestionRequested];
+// ---------------------------------------------------------------------------
+// Function 5: email-sync-tick (EM8 — EMAIL_INGESTION.md §18.3)
+//
+// The first cron-triggered function in this codebase. Carries ZERO
+// client-specific or provider-specific data by design — it does not know
+// which clients have email connections, never touches oauth_connections,
+// and never becomes provider-aware (a narrow, deliberate exception to
+// ADR-001's "AIKB stays provider-agnostic" boundary; AIKB contributes only
+// "a clock," see relativityTickClient.js's header comment). Fires on a
+// fixed interval and makes exactly one signed, system-scoped HTTP call to
+// Relativity's POST /api/integrations/email/sync/tick, which does all the
+// real work (enumerating due automatic-mode connections and syncing them).
+// No concurrency key — this is a single global tick, not a per-client job.
+// ---------------------------------------------------------------------------
 
-module.exports = { functions, ingestDocument, deleteDocument, reindexDocument, slackQuestionRequested };
+const emailSyncTick = inngest.createFunction(
+  {
+    id: 'email-sync-tick',
+    name: 'Email Automatic Sync Tick',
+    retries: config.inngest.defaultRetries,
+    onFailure: async ({ error }) => {
+      // No Relativity callback to make on failure here (unlike
+      // slackQuestionRequested's onFailure) — there is no specific
+      // client/request this tick failure needs to notify; Relativity's own
+      // per-connection error handling inside runTick already isolates and
+      // records individual connection failures regardless of whether this
+      // particular tick call succeeded end-to-end.
+      console.error('[email-sync-tick] onFailure', { error: error && error.message });
+    },
+  },
+  { cron: config.emailSync.tickCronSchedule },
+  async ({ step }) => {
+    return step.run('call-relativity-tick', async () => relativityTickClient.callTick());
+  }
+);
+
+const functions = [ingestDocument, deleteDocument, reindexDocument, slackQuestionRequested, emailSyncTick];
+
+module.exports = { functions, ingestDocument, deleteDocument, reindexDocument, slackQuestionRequested, emailSyncTick };
