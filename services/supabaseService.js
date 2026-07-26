@@ -202,14 +202,46 @@ async function getKnowledgeDocumentById(clientId, documentId) {
   return data;
 }
 
-async function getDocumentsByClient(clientId) {
+// EM9 (EMAIL_INGESTION.md §24.1, §24.5) — sourceProvider/providerAccountId/
+// contributingMemberId are all optional and additive; every existing caller
+// (GET /documents/:clientId with no filters) is unaffected. providerAccountId
+// and contributingMemberId live on email_source_messages, not
+// knowledge_documents (§13.2), so filtering by either requires a first,
+// separate lookup to resolve document ids — two plain queries rather than
+// one embedded join, the same tradeoff already made for
+// listDueAutomaticConnections (Relativity's emailSyncService.js, EM8
+// deviation 4) and for the same reason: this codebase has no existing
+// precedent for depending on Postgrest's cross-table embed inference, and
+// two queries is simpler to read and correct at this codebase's current
+// scale (§29).
+async function getDocumentsByClient(clientId, { sourceProvider, providerAccountId, contributingMemberId } = {}) {
   const { supabase } = await getAikbDatabase(clientId);
-  const { data, error } = await supabase
+
+  let documentIdFilter = null;
+  if (providerAccountId || contributingMemberId) {
+    let messagesQuery = supabase
+      .from('email_source_messages')
+      .select('document_id')
+      .eq('client_id', clientId);
+    if (providerAccountId) messagesQuery = messagesQuery.eq('provider_account_id', providerAccountId);
+    if (contributingMemberId) messagesQuery = messagesQuery.eq('contributing_member_id', contributingMemberId);
+
+    const { data: messageRows, error: messagesError } = await messagesQuery;
+    if (messagesError) throw new Error(`getDocumentsByClient (email_source_messages): ${messagesError.message}`);
+    documentIdFilter = (messageRows || []).map((row) => row.document_id);
+    if (documentIdFilter.length === 0) return [];
+  }
+
+  let documentsQuery = supabase
     .from('knowledge_documents')
     .select('*')
     .eq('client_id', clientId)
     .neq('status', 'deleted')
     .order('created_at', { ascending: false });
+  if (sourceProvider) documentsQuery = documentsQuery.eq('source_provider', sourceProvider);
+  if (documentIdFilter) documentsQuery = documentsQuery.in('id', documentIdFilter);
+
+  const { data, error } = await documentsQuery;
   if (error) throw new Error(`getDocumentsByClient: ${error.message}`);
   return data;
 }

@@ -236,6 +236,14 @@ router.delete('/client/:clientId', requireServiceRequest, async (req, res, next)
 // routed through any cache/proxy that would strip it). clientId is trusted
 // ONLY from req.serviceRequest; the URL param is kept for REST
 // addressability/logging and cross-checked below.
+//
+// EM9 (EMAIL_INGESTION.md §24.1, §24.5) — optional, additive
+// sourceProvider/providerAccountId/contributingMemberId filters read from
+// the signed payload (never the untrusted URL). A caller that omits all
+// three (every pre-EM9 caller) gets byte-for-byte the same unfiltered list
+// as before. This is what Relativity's disconnect-with-cleanup path
+// (services/emailConnectionService.js) uses to enumerate only the documents
+// an offboarded/disconnecting member contributed.
 // ---------------------------------------------------------------------------
 
 router.get('/documents/:clientId', requireServiceRequest, async (req, res, next) => {
@@ -245,7 +253,8 @@ router.get('/documents/:clientId', requireServiceRequest, async (req, res, next)
       return res.status(400).json({ error: 'URL clientId does not match the signed envelope.' });
     }
     await supabaseService.requireActiveClient(clientId);
-    const docs = await supabaseService.getDocumentsByClient(clientId);
+    const { sourceProvider, providerAccountId, contributingMemberId } = req.servicePayload || {};
+    const docs = await supabaseService.getDocumentsByClient(clientId, { sourceProvider, providerAccountId, contributingMemberId });
     res.json({ documents: docs });
   } catch (err) {
     next(err);
