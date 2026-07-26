@@ -1288,6 +1288,26 @@ async function upsertEmailSourceMessage(clientId, documentId, emailMetadata, con
   return data;
 }
 
+// EM10 (EMAIL_INGESTION.md §23) — citation-generalization's own read path:
+// runKnowledgeQuery.js resolves this once per query, keyed by the distinct
+// document ids among that query's retrieved chunks, so generateRagAnswer's
+// context-block formatting and the sourceMap-building step both have
+// subject/from/sentAt/providerThreadId/deepLinkUrl available without either
+// one running its own separate lookup. Returns only the columns citation
+// formatting actually needs — never the full row (no folder_or_labels,
+// content_hash, etc., which citations have no use for).
+async function getEmailSourceMessagesByDocumentIds(clientId, documentIds) {
+  if (!Array.isArray(documentIds) || documentIds.length === 0) return [];
+  const { supabase } = await getAikbDatabase(clientId);
+  const { data, error } = await supabase
+    .from('email_source_messages')
+    .select('document_id, subject, from_address, from_name, sent_at, provider_thread_id, deep_link_url')
+    .eq('client_id', clientId)
+    .in('document_id', documentIds);
+  if (error) throw new Error(`getEmailSourceMessagesByDocumentIds: ${error.message}`);
+  return data || [];
+}
+
 // ---------------------------------------------------------------------------
 // Knowledge gaps
 // ---------------------------------------------------------------------------
@@ -1519,6 +1539,7 @@ module.exports = {
   markSlackRequestFailed,
   getIndexedDocumentByContentHash,
   upsertEmailSourceMessage,
+  getEmailSourceMessagesByDocumentIds,
   getClientSummaryData,
   getClientAnalyticsData,
   getClientKnowledgeStats,

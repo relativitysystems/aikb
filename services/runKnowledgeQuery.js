@@ -274,6 +274,29 @@ async function runKnowledgeQuery({
     topScore: chunks[0]?.similarity ?? null,
   });
 
+  // EM10 (EMAIL_INGESTION.md §23) — resolve email_source_messages once, by
+  // the distinct document ids among THIS query's retrieved chunks (never
+  // every email document for the client), keyed for both generateRagAnswer's
+  // context-block formatting and the sourceMap-building step below to share.
+  // chunk.metadata.sourceProvider (set at ingest time, inngest/functions.js's
+  // baseMetadata) is the discriminator — a chunk from a portal_upload/Slack
+  // document never matches and skips this entirely.
+  const emailDocumentIds = [...new Set(
+    chunks
+      .filter((c) => c.metadata && ['gmail', 'microsoft'].includes(c.metadata.sourceProvider))
+      .map((c) => c.document_id)
+  )];
+  const emailSourceMessages = emailDocumentIds.length
+    ? await supabaseService.getEmailSourceMessagesByDocumentIds(clientId, emailDocumentIds)
+    : [];
+  const emailByDocumentId = new Map(emailSourceMessages.map((m) => [m.document_id, m]));
+  const enrichedChunks = emailByDocumentId.size === 0
+    ? chunks
+    : chunks.map((c) => {
+        const email = emailByDocumentId.get(c.document_id);
+        return email ? { ...c, metadata: { ...c.metadata, email } } : c;
+      });
+
   if (!chunks.length) {
     const answer = normalizeGapAnswerSource('I couldn\'t find any relevant information in the knowledge base for your question.');
     if (persistConversation) {
@@ -294,20 +317,55 @@ async function runKnowledgeQuery({
     return { answer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'no_chunks_found', userMessageId: userMsg ? userMsg.id : null, intent };
   }
 
-  const answer = await openaiService.generateRagAnswer(question, chunks, recentSessionMessages);
+  const answer = await openaiService.generateRagAnswer(question, enrichedChunks, recentSessionMessages);
 
+  // EM10 (§23) — an email-sourced document (chunk.metadata.email, set by
+  // the enrichment above) gets a distinct citation shape from a plain
+  // uploaded document: subject/from/sentAt/deepLinkUrl instead of
+  // fileName/pages, plus providerThreadId for the portal's thread-grouped
+  // display (§20 "Threading UI"). `title` is included on the email shape
+  // specifically so services/slackAnswerFormatter.js's existing
+  // `source.title || source.fileName` fallback keeps working unchanged for
+  // Slack-originated answers, without that file needing an email-specific
+  // branch of its own.
   const sourceMap = new Map();
-  for (const chunk of chunks) {
-    const name = chunk.metadata && chunk.metadata.fileName ? chunk.metadata.fileName : 'unknown';
+  for (const chunk of enrichedChunks) {
     const docId = chunk.document_id;
+    const email = chunk.metadata && chunk.metadata.email;
     if (!sourceMap.has(docId)) {
-      sourceMap.set(docId, { fileName: name, documentId: docId, pages: new Set() });
+      if (email) {
+        sourceMap.set(docId, {
+          type: 'email',
+          documentId: docId,
+          subject: email.subject || '(no subject)',
+          from: email.from_name || email.from_address || null,
+          sentAt: email.sent_at || null,
+          deepLinkUrl: email.deep_link_url || null,
+          providerThreadId: email.provider_thread_id || null,
+        });
+      } else {
+        const name = chunk.metadata && chunk.metadata.fileName ? chunk.metadata.fileName : 'unknown';
+        sourceMap.set(docId, { type: 'document', fileName: name, documentId: docId, pages: new Set() });
+      }
     }
-    if (chunk.metadata && chunk.metadata.pageNumber != null) {
+    if (!email && chunk.metadata && chunk.metadata.pageNumber != null) {
       sourceMap.get(docId).pages.add(chunk.metadata.pageNumber);
     }
   }
   const sources = Array.from(sourceMap.values()).map((s) => {
+    if (s.type === 'email') {
+      const src = {
+        documentId: s.documentId,
+        fileName: `${s.subject}.txt`, // backward-compatible fallback for any consumer that only ever reads fileName
+        title: `"${s.subject}" from ${s.from || 'unknown sender'}`,
+        subject: s.subject,
+        from: s.from,
+        sentAt: s.sentAt,
+        deepLinkUrl: s.deepLinkUrl,
+      };
+      if (s.providerThreadId) src.providerThreadId = s.providerThreadId;
+      return src;
+    }
     const src = { fileName: s.fileName, documentId: s.documentId };
     if (s.pages.size > 0) {
       src.pages = Array.from(s.pages).sort((a, b) => a - b);

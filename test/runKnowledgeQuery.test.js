@@ -81,6 +81,13 @@ function createFakeSupabaseService() {
     async searchChunksWithTitleBoost() {
       return { chunks: [], matchedDocumentIds: [] };
     },
+    // EM10 (§23) — overridden per-test with a fixture; the default (empty)
+    // is exercised by every pre-EM10 test here, none of which ever sets
+    // metadata.sourceProvider to gmail/microsoft, so runKnowledgeQuery's own
+    // emailDocumentIds.length guard means this is never even called for them.
+    async getEmailSourceMessagesByDocumentIds() {
+      return [];
+    },
     _sessions: sessions,
     _messages: messages,
     _gapsByIdempotencyKey: gapsByIdempotencyKey,
@@ -125,6 +132,101 @@ test('a normal question with retrieved chunks returns a grounded answer with sou
   assert.deepEqual(result.sources, [{ fileName: 'PTO.pdf', documentId: 'doc-1', pages: [2] }]);
   assert.ok(result.sessionId);
   assert.ok(result.userMessageId);
+});
+
+// ─────────────────────────────────────────────
+// EM10 — email-sourced citations (EMAIL_INGESTION.md §23)
+// ─────────────────────────────────────────────
+
+test('an email-sourced chunk resolves email_source_messages and returns a subject/from/sentAt/deepLinkUrl citation, not fileName/pages', async () => {
+  const supabaseService = createFakeSupabaseService();
+  supabaseService.searchChunksWithTitleBoost = async () => ({
+    chunks: [{ document_id: 'doc-email-1', similarity: 0.8, metadata: { sourceProvider: 'gmail', sourceFileId: 'msg-1' } }],
+    matchedDocumentIds: [],
+  });
+  const emailLookupCalls = [];
+  supabaseService.getEmailSourceMessagesByDocumentIds = async (clientId, documentIds) => {
+    emailLookupCalls.push({ clientId, documentIds });
+    return [{
+      document_id: 'doc-email-1', subject: 'Q3 Renewal Terms', from_address: 'jane@client.com',
+      from_name: 'Jane Doe', sent_at: '2026-07-20T12:00:00Z', provider_thread_id: 'thread-1',
+      deep_link_url: 'https://mail.google.com/mail/u/0/#all/msg-1',
+    }];
+  };
+  const openaiService = createFakeOpenaiService();
+
+  const result = await runKnowledgeQuery({ clientId: CLIENT_ID, question: 'What are the renewal terms?', origin: 'portal', deps: { supabaseService, openaiService } });
+
+  assert.equal(emailLookupCalls.length, 1);
+  assert.deepEqual(emailLookupCalls[0], { clientId: CLIENT_ID, documentIds: ['doc-email-1'] });
+  assert.deepEqual(result.sources, [{
+    documentId: 'doc-email-1',
+    fileName: 'Q3 Renewal Terms.txt',
+    title: '"Q3 Renewal Terms" from Jane Doe',
+    subject: 'Q3 Renewal Terms',
+    from: 'Jane Doe',
+    sentAt: '2026-07-20T12:00:00Z',
+    deepLinkUrl: 'https://mail.google.com/mail/u/0/#all/msg-1',
+    providerThreadId: 'thread-1',
+  }]);
+});
+
+test('email lookup is skipped entirely when no retrieved chunk is email-sourced (getEmailSourceMessagesByDocumentIds never called)', async () => {
+  const supabaseService = createFakeSupabaseService();
+  supabaseService.searchChunksWithTitleBoost = async () => ({
+    chunks: [{ document_id: 'doc-1', similarity: 0.8, metadata: { fileName: 'PTO.pdf', pageNumber: 2 } }],
+    matchedDocumentIds: [],
+  });
+  let lookupCalled = false;
+  supabaseService.getEmailSourceMessagesByDocumentIds = async () => { lookupCalled = true; return []; };
+  const openaiService = createFakeOpenaiService();
+
+  await runKnowledgeQuery({ clientId: CLIENT_ID, question: 'What is our PTO policy?', origin: 'portal', deps: { supabaseService, openaiService } });
+  assert.equal(lookupCalled, false);
+});
+
+test('two chunks from the SAME email document collapse into one citation (dedup by document_id, matching the existing document-source behavior)', async () => {
+  const supabaseService = createFakeSupabaseService();
+  supabaseService.searchChunksWithTitleBoost = async () => ({
+    chunks: [
+      { document_id: 'doc-email-1', similarity: 0.8, metadata: { sourceProvider: 'gmail' } },
+      { document_id: 'doc-email-1', similarity: 0.7, metadata: { sourceProvider: 'gmail' } },
+    ],
+    matchedDocumentIds: [],
+  });
+  supabaseService.getEmailSourceMessagesByDocumentIds = async () => ([{
+    document_id: 'doc-email-1', subject: 'Renewal', from_address: 'jane@client.com', from_name: null,
+    sent_at: null, provider_thread_id: null, deep_link_url: null,
+  }]);
+  const openaiService = createFakeOpenaiService();
+
+  const result = await runKnowledgeQuery({ clientId: CLIENT_ID, question: 'q', origin: 'portal', deps: { supabaseService, openaiService } });
+  assert.equal(result.sources.length, 1);
+  assert.equal(result.sources[0].from, 'jane@client.com'); // falls back to from_address when from_name is null
+  assert.ok(!('providerThreadId' in result.sources[0])); // omitted, not null, when the row has no thread id
+});
+
+test('a mixed result (one document chunk, one email chunk) returns both citation shapes correctly, each keyed to its own document', async () => {
+  const supabaseService = createFakeSupabaseService();
+  supabaseService.searchChunksWithTitleBoost = async () => ({
+    chunks: [
+      { document_id: 'doc-1', similarity: 0.9, metadata: { fileName: 'Handbook.pdf', pageNumber: 5 } },
+      { document_id: 'doc-email-1', similarity: 0.8, metadata: { sourceProvider: 'microsoft' } },
+    ],
+    matchedDocumentIds: [],
+  });
+  supabaseService.getEmailSourceMessagesByDocumentIds = async (clientId, documentIds) => {
+    assert.deepEqual(documentIds, ['doc-email-1']); // never asked to resolve the non-email document
+    return [{ document_id: 'doc-email-1', subject: 'Renewal', from_address: 'jane@client.com', from_name: null, sent_at: null, provider_thread_id: null, deep_link_url: null }];
+  };
+  const openaiService = createFakeOpenaiService();
+
+  const result = await runKnowledgeQuery({ clientId: CLIENT_ID, question: 'q', origin: 'portal', deps: { supabaseService, openaiService } });
+  assert.equal(result.sources.length, 2);
+  const doc = result.sources.find((s) => s.documentId === 'doc-1');
+  const email = result.sources.find((s) => s.documentId === 'doc-email-1');
+  assert.deepEqual(doc, { fileName: 'Handbook.pdf', documentId: 'doc-1', pages: [5] });
+  assert.equal(email.subject, 'Renewal');
 });
 
 test('no chunks found returns a knowledge-gap result with gapReason no_chunks_found, and auto-persists a system-reported gap', async () => {

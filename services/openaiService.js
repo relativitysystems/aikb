@@ -136,18 +136,53 @@ async function embedQuery(text) {
 // Chat completions
 // ---------------------------------------------------------------------------
 
+// EM10 (EMAIL_INGESTION.md §23) — human-readable date for the LLM's own
+// context-block citation line and, where used, the structured sources[]
+// entry's display. Deliberately does not throw on a bad/missing value —
+// context-block formatting must never fail a whole answer over one
+// malformed timestamp.
+function formatCitationDate(isoString) {
+  if (!isoString) return null;
+  const d = new Date(isoString);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
 /**
- * Generate a RAG answer given retrieved context chunks and a user question.
- * contextChunks: [{ content, metadata: { fileName, ... } }]
+ * Pure formatting of the numbered `[i] Source: ...` context blocks sent to
+ * the LLM (EM10 — §23) — extracted from generateRagAnswer so it's directly
+ * unit-testable without a real OpenAI call (generateRagAnswer itself always
+ * hits the network, matching this file's existing no-direct-test
+ * convention; runKnowledgeQuery.test.js fakes generateRagAnswer wholesale).
+ * contextChunks: [{ content, metadata: { fileName, pageNumber? } }] for a
+ * plain document chunk, or [{ content, metadata: { email: { subject,
+ * from_address, from_name, sent_at, ... } } }] for an email-sourced chunk,
+ * populated by runKnowledgeQuery.js's enrichment step before this is ever
+ * called — this function never queries email_source_messages itself.
  */
-async function generateRagAnswer(question, contextChunks, sessionMessages = []) {
-  const contextText = contextChunks
+function buildContextText(contextChunks) {
+  return contextChunks
     .map((c, i) => {
+      const email = c.metadata && c.metadata.email;
+      if (email) {
+        const from = email.from_name || email.from_address || 'unknown sender';
+        const date = formatCitationDate(email.sent_at);
+        const subject = email.subject || '(no subject)';
+        const source = `Email — "${subject}" from ${from}${date ? `, ${date}` : ''}`;
+        return `[${i + 1}] Source: ${source}\n${c.content}`;
+      }
       const source = c.metadata && c.metadata.fileName ? c.metadata.fileName : 'unknown';
       const page = c.metadata && c.metadata.pageNumber != null ? `, p. ${c.metadata.pageNumber}` : '';
       return `[${i + 1}] Source: ${source}${page}\n${c.content}`;
     })
     .join('\n\n---\n\n');
+}
+
+/**
+ * Generate a RAG answer given retrieved context chunks and a user question.
+ */
+async function generateRagAnswer(question, contextChunks, sessionMessages = []) {
+  const contextText = buildContextText(contextChunks);
 
   const messages = [
     ...sessionMessages,
@@ -538,4 +573,6 @@ module.exports = {
   classifyQueryIntent,
   buildRetrievalQuery,
   buildNonRetrievalAnswer,
+  buildContextText,
+  formatCitationDate,
 };
