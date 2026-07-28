@@ -19,12 +19,29 @@ Copy `.env.example` to `.env` and fill in the values below.
 | `GLOBAL_SUPABASE_SERVICE_KEY` | **Yes** | Service role key for Relativity_Global |
 | `OPENAI_API_KEY` | **Yes** | OpenAI API key for embeddings and chat completions |
 | `OPENAI_EMBEDDING_MODEL` | No (default `text-embedding-3-small`) | Embedding model name |
-| `INNGEST_EVENT_KEY` | No | Inngest event key (required in production) |
-| `INNGEST_SIGNING_KEY` | No | Inngest signing key (required in production) |
-| `AIKB_STORAGE_BUCKET` | Yes | Supabase Storage bucket name where portal documents are uploaded |
-| `API_KEY` | Yes (in production) | Shared secret for `x-api-key` header on all `/api/knowledge/*` routes |
-| `SLACK_BOT_TOKEN` | No | Slack bot token for the RAG Slack bot |
-| `SLACK_SIGNING_SECRET` | No | Slack signing secret for event verification |
+| `OPENAI_CHAT_MODEL` | No (default `gpt-4.1`) | Full RAG answers / general chat completions |
+| `OPENAI_LIGHTWEIGHT_MODEL` | No (default `gpt-4o-mini`) | Intent classifier + retrieval query rewriter |
+| `INNGEST_EVENT_KEY` | Yes in production | Inngest event key |
+| `INNGEST_SIGNING_KEY` | Yes in production | Inngest signing key |
+| `INNGEST_DEFAULT_RETRIES` | No (default `3`) | Retry count applied to every Inngest function |
+| `AIKB_STORAGE_BUCKET` | No (default `aikb-documents`) | Supabase Storage bucket name where portal documents are uploaded |
+| `MAX_UPLOAD_BYTES` | No (default `10485760`, 10 MB) | Max file size accepted for ingestion |
+| `API_KEY` | Yes in production | Shared secret for `x-api-key` header on all `/api/knowledge/*` routes |
+| `KNOWLEDGE_API_RATE_LIMIT_WINDOW_MS` / `_MAX` | No (default 15 min / 2000) | Defense-in-depth rate limit across `/api/knowledge/*` |
+| `RECENT_INGESTION_JOBS_LIMIT` | No (default `100`) | Window for client stats/health endpoints |
+| `RECENT_ACTIVITY_LIMIT` | No (default `10`) | "Recent" slice in analytics/stats responses |
+| `CHAT_CONTEXT_MESSAGE_LIMIT` | No (default `8`) | Prior messages fed to the intent classifier/query rewriter |
+| `KNOWLEDGE_GAPS_LIST_LIMIT` | No (default `200`) | Row cap for the admin knowledge-gaps list |
+| `SLACK_SIGNING_SECRET` | Yes in production | Verifies the retired `/api/slack/events` endpoint's webhook signature (see note below) |
+| `SERVICE_REQUEST_SIGNING_SECRET` | **Yes** | HMAC envelope shared with Relativity, scoped to `/api/knowledge/ask` and `/api/integrations/slack/deliver` |
+| `RELATIVITY_API_BASE_URL` | **Yes** | Relativity's base URL, called back for Slack delivery and the email sync tick |
+| `RELATIVITY_DELIVER_TIMEOUT_MS` | No (default `8000`) | Timeout for the Slack-answer delivery callback to Relativity |
+| `RELATIVITY_TICK_TIMEOUT_MS` | No (default `15000`) | Timeout for the email sync tick callback to Relativity |
+| `EMAIL_SYNC_TICK_CRON_SCHEDULE` | No (default `*/20 * * * *`) | Cadence of the automatic email-sync scheduler |
+
+> `POST /api/slack/events` is **retired** (Architecture Review Phase 4, Milestone 1 — see ADR-003 "Slack Events Live in Relativity" in the Architecture repo) — it answers Slack's `url_verification` challenge and returns `410 Gone` for every real event. Slack Events ingestion now lives entirely in Relativity. `SLACK_SIGNING_SECRET` is still required in production so this endpoint can verify (and reject) unsigned traffic before responding.
+>
+> Two additional service-to-service routes exist beyond the ones documented below: `POST /api/knowledge/ask` (the Slack Q&A pipeline's accept-and-enqueue leg, called by Relativity) and `POST /api/knowledge/chat/redact` (ADR-007 redaction callback). Both are signed with `SERVICE_REQUEST_SIGNING_SECRET`, not `x-api-key` alone.
 
 ---
 
