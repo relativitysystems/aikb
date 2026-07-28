@@ -24,6 +24,7 @@ const configPath = require.resolve('../config');
 // The env vars this suite manipulates, so each test can save/restore them
 // and never leak a value into another test or file.
 const MANAGED_VARS = [
+  'NODE_ENV',
   'OPENAI_CHAT_MODEL',
   'OPENAI_LIGHTWEIGHT_MODEL',
   'INNGEST_DEFAULT_RETRIES',
@@ -34,6 +35,11 @@ const MANAGED_VARS = [
   'RECENT_ACTIVITY_LIMIT',
   'CHAT_CONTEXT_MESSAGE_LIMIT',
   'KNOWLEDGE_GAPS_LIST_LIMIT',
+  'SLACK_SIGNING_SECRET',
+  'INNGEST_EVENT_KEY',
+  'INNGEST_SIGNING_KEY',
+  'SERVICE_REQUEST_SIGNING_SECRET',
+  'RELATIVITY_API_BASE_URL',
 ];
 
 // Loads a fresh config/index.js under the given env overrides (merged onto
@@ -163,3 +169,59 @@ test('a non-positive-integer pagination override fails clearly rather than silen
     /Invalid CHAT_CONTEXT_MESSAGE_LIMIT/
   );
 });
+
+// Coverage for require_env_in_production: SLACK_SIGNING_SECRET,
+// INNGEST_EVENT_KEY, INNGEST_SIGNING_KEY, SERVICE_REQUEST_SIGNING_SECRET,
+// and RELATIVITY_API_BASE_URL are all optional in development (the
+// pre-existing behavior every other test in this file already relies on
+// implicitly, since none of them set these vars) but must fail fast at boot
+// in production rather than surfacing as a 500 or a silently-never-firing
+// callback on first use — this is what caught SLACK_SIGNING_SECRET missing
+// on Railway in production during the env audit.
+
+const PROD_REQUIRED_VARS = [
+  'SLACK_SIGNING_SECRET',
+  'INNGEST_EVENT_KEY',
+  'INNGEST_SIGNING_KEY',
+  'SERVICE_REQUEST_SIGNING_SECRET',
+  'RELATIVITY_API_BASE_URL',
+];
+
+const VALID_PROD_ENV = {
+  NODE_ENV: 'production',
+  SLACK_SIGNING_SECRET: 'test-slack-secret',
+  INNGEST_EVENT_KEY: 'test-event-key',
+  INNGEST_SIGNING_KEY: 'test-signing-key',
+  SERVICE_REQUEST_SIGNING_SECRET: 'test-service-request-secret',
+  RELATIVITY_API_BASE_URL: 'https://relativity.example.internal',
+};
+
+test('production-required vars are optional outside production', () => {
+  withConfig({ NODE_ENV: 'development' }, (config) => {
+    assert.equal(config.slack.signingSecret, '');
+    assert.equal(config.inngest.eventKey, '');
+    assert.equal(config.inngest.signingKey, '');
+    assert.equal(config.serviceRequest.signingSecret, '');
+    assert.equal(config.relativity.apiBaseUrl, '');
+  });
+});
+
+test('config loads in production once every production-required var is set', () => {
+  withConfig(VALID_PROD_ENV, (config) => {
+    assert.equal(config.slack.signingSecret, 'test-slack-secret');
+    assert.equal(config.inngest.eventKey, 'test-event-key');
+    assert.equal(config.inngest.signingKey, 'test-signing-key');
+    assert.equal(config.serviceRequest.signingSecret, 'test-service-request-secret');
+    assert.equal(config.relativity.apiBaseUrl, 'https://relativity.example.internal');
+  });
+});
+
+for (const missingVar of PROD_REQUIRED_VARS) {
+  test(`config throws at load time in production when ${missingVar} is missing`, () => {
+    const envOverrides = { ...VALID_PROD_ENV, [missingVar]: '' };
+    assert.throws(
+      () => withConfig(envOverrides, (config) => config),
+      new RegExp(`Missing required environment variable in production: ${missingVar}`)
+    );
+  });
+}

@@ -2,9 +2,25 @@
 
 require('dotenv').config();
 
+const nodeEnv = process.env.NODE_ENV || 'development';
+
 function require_env(key) {
   const val = process.env[key];
   if (!val) throw new Error(`Missing required environment variable: ${key}`);
+  return val;
+}
+
+// Like require_env, but only enforced when NODE_ENV=production. For values
+// that are genuinely optional in local dev but load-bearing once deployed —
+// missing any of these previously failed silently (a 500 on first request,
+// or a callback that never fires) rather than at boot, which is how
+// SLACK_SIGNING_SECRET went unset in production undetected until routes/
+// slack.js's own request-time check started rejecting every request.
+function require_env_in_production(key) {
+  const val = process.env[key];
+  if (nodeEnv === 'production' && !val) {
+    throw new Error(`Missing required environment variable in production: ${key}`);
+  }
   return val;
 }
 
@@ -23,7 +39,7 @@ function parsePositiveInt(name, rawValue, defaultValue) {
 const config = {
   server: {
     port: parseInt(process.env.PORT || '3000', 10),
-    nodeEnv: process.env.NODE_ENV || 'development',
+    nodeEnv,
   },
   supabase: {
     aikb: {
@@ -48,15 +64,15 @@ const config = {
     lightweightModel: process.env.OPENAI_LIGHTWEIGHT_MODEL || 'gpt-4o-mini',
   },
   inngest: {
-    eventKey: process.env.INNGEST_EVENT_KEY,
-    signingKey: process.env.INNGEST_SIGNING_KEY,
+    eventKey: require_env_in_production('INNGEST_EVENT_KEY'),
+    signingKey: require_env_in_production('INNGEST_SIGNING_KEY'),
     // Applied to every inngest.createFunction in inngest/functions.js — a
     // single shared retry policy rather than 4 independently-duplicated
     // literals.
     defaultRetries: parsePositiveInt('INNGEST_DEFAULT_RETRIES', process.env.INNGEST_DEFAULT_RETRIES, 3),
   },
   slack: {
-    signingSecret: process.env.SLACK_SIGNING_SECRET,
+    signingSecret: require_env_in_production('SLACK_SIGNING_SECRET'),
   },
   storage: {
     bucket: process.env.AIKB_STORAGE_BUCKET || 'aikb-documents',
@@ -102,7 +118,7 @@ const config = {
   // /api/integrations/slack/deliver (signed here, verified by Relativity).
   // Must match Relativity's SERVICE_REQUEST_SIGNING_SECRET exactly.
   serviceRequest: {
-    signingSecret: process.env.SERVICE_REQUEST_SIGNING_SECRET,
+    signingSecret: require_env_in_production('SERVICE_REQUEST_SIGNING_SECRET'),
   },
   // Relativity's base URL. Called back for two routes: POST
   // /api/integrations/slack/deliver once a Slack-originated question has an
@@ -111,7 +127,7 @@ const config = {
   // (services/relativityTickClient.js, EMAIL_INGESTION.md §18.3) — AIKB
   // calls no other Relativity route.
   relativity: {
-    apiBaseUrl: process.env.RELATIVITY_API_BASE_URL,
+    apiBaseUrl: require_env_in_production('RELATIVITY_API_BASE_URL'),
     deliverTimeoutMs: parseInt(process.env.RELATIVITY_DELIVER_TIMEOUT_MS || '8000', 10),
     // EM8 — separate timeout from deliverTimeoutMs since the tick call has
     // a different, unrelated caller (a cron function, not a Slack question
