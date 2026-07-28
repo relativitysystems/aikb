@@ -55,7 +55,7 @@ function parsePdf(buffer, opts) {
  *   application/pdf                      — extracted via pdf-parse
  *   .docx (openxmlformats wordprocessingml) — extracted via mammoth
  *   application/vnd.google-apps.*        — should never reach here;
- *                                          googleDriveService exports Google Docs as text/plain
+ *                                          Google Docs must be exported as text/plain upstream
  *
  * Throws UnsupportedMimeTypeError for unrecognised types.
  *
@@ -123,7 +123,7 @@ async function parseDocument(buffer, mimeType, fileName) {
     return { text: fullText, pages };
   }
 
-  // Google Docs exports should have already been converted to text/plain by googleDriveService
+  // Google Docs exports should have already been converted to text/plain upstream
   if (type.startsWith('application/vnd.google-apps.')) {
     throw new UnsupportedMimeTypeError(
       `${mimeType} — Google Docs must be exported as text/plain before parsing`

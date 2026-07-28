@@ -89,13 +89,6 @@ const config = {
       max: parsePositiveInt('KNOWLEDGE_API_RATE_LIMIT_MAX', process.env.KNOWLEDGE_API_RATE_LIMIT_MAX, 2000),
     },
   },
-  // services/googleDriveService.js — currently unreferenced by any route or
-  // Inngest function (Google Drive sync was removed; see .env.example), kept
-  // for possible future use. pageSize only, since serviceAccountEmail/
-  // privateKey were intentionally retired and are not reintroduced here.
-  googleDrive: {
-    pageSize: parsePositiveInt('GOOGLE_DRIVE_PAGE_SIZE', process.env.GOOGLE_DRIVE_PAGE_SIZE, 200),
-  },
   // Result-set caps for admin/analytics-style reads (services/supabaseService.js).
   // Tuning these trades off dashboard completeness against query cost as
   // per-client data volume grows.

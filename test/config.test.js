@@ -2,9 +2,9 @@
 
 // Coverage for config/index.js's newly centralized operational values
 // (hardcoded-values audit follow-up): OpenAI model selection, Inngest retry
-// count, the knowledge API rate limiter, the Google Drive page size, and the
-// Supabase pagination defaults. Each is asserted for (a) its pre-existing
-// default when the env var is unset and (b) picking up an explicit override.
+// count, the knowledge API rate limiter, and the Supabase pagination
+// defaults. Each is asserted for (a) its pre-existing default when the env
+// var is unset and (b) picking up an explicit override.
 // Follows the require.cache-busting pattern already used by
 // test/aikbDatabaseProvider.test.js since config/index.js is a singleton
 // module re-evaluated from process.env on every require.
@@ -30,7 +30,6 @@ const MANAGED_VARS = [
   'INNGEST_DEFAULT_RETRIES',
   'KNOWLEDGE_API_RATE_LIMIT_WINDOW_MS',
   'KNOWLEDGE_API_RATE_LIMIT_MAX',
-  'GOOGLE_DRIVE_PAGE_SIZE',
   'RECENT_INGESTION_JOBS_LIMIT',
   'RECENT_ACTIVITY_LIMIT',
   'CHAT_CONTEXT_MESSAGE_LIMIT',
@@ -121,18 +120,6 @@ test('rateLimit.knowledgeApi picks up env overrides', () => {
   withConfig({ KNOWLEDGE_API_RATE_LIMIT_WINDOW_MS: '60000', KNOWLEDGE_API_RATE_LIMIT_MAX: '100' }, (config) => {
     assert.equal(config.rateLimit.knowledgeApi.windowMs, 60000);
     assert.equal(config.rateLimit.knowledgeApi.max, 100);
-  });
-});
-
-test('googleDrive.pageSize defaults to 200 when unset', () => {
-  withConfig({}, (config) => {
-    assert.equal(config.googleDrive.pageSize, 200);
-  });
-});
-
-test('googleDrive.pageSize picks up an env override', () => {
-  withConfig({ GOOGLE_DRIVE_PAGE_SIZE: '50' }, (config) => {
-    assert.equal(config.googleDrive.pageSize, 50);
   });
 });
 
