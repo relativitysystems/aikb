@@ -113,12 +113,14 @@ const config = {
   serviceRequest: {
     signingSecret: require_env_in_production('SERVICE_REQUEST_SIGNING_SECRET'),
   },
-  // Relativity's base URL. Called back for two routes: POST
+  // Relativity's base URL. Called back for three routes: POST
   // /api/integrations/slack/deliver once a Slack-originated question has an
-  // answer (services/relativityDeliverClient.js), and, as of EM8, POST
-  // /api/integrations/email/sync/tick on a cron interval
-  // (services/relativityTickClient.js, EMAIL_INGESTION.md §18.3) — AIKB
-  // calls no other Relativity route.
+  // answer (services/relativityDeliverClient.js), POST
+  // /api/integrations/email/sync/tick on a cron interval (services/
+  // relativityTickClient.js, EMAIL_INGESTION.md §18.3), and, as of EL3, POST
+  // /api/tools/execute for the read-only email-tool registry (services/
+  // toolExecutionClient.js, LIVE_EMAIL_LOOKUP.md §1.1 step 7) — AIKB calls
+  // no other Relativity route.
   relativity: {
     apiBaseUrl: require_env_in_production('RELATIVITY_API_BASE_URL'),
     deliverTimeoutMs: parseInt(process.env.RELATIVITY_DELIVER_TIMEOUT_MS || '8000', 10),
@@ -127,6 +129,11 @@ const config = {
     // request) and may need independent tuning as the fan-out logic on the
     // Relativity side grows.
     tickTimeoutMs: parseInt(process.env.RELATIVITY_TICK_TIMEOUT_MS || '15000', 10),
+    // EL3 — same reasoning as tickTimeoutMs above: a distinct call shape
+    // (a per-question tool call, not a Slack answer or a cron tick) gets
+    // its own tunable timeout. Matches deliverTimeoutMs's default since
+    // both are synchronous, in-request-flow calls the user is waiting on.
+    toolExecuteTimeoutMs: parseInt(process.env.RELATIVITY_TOOL_EXECUTE_TIMEOUT_MS || '8000', 10),
   },
   // EM8 (§18.3) — the automatic-sync scheduler's own cron cadence. Should
   // roughly match Relativity's EMAIL_SYNC_TICK_INTERVAL_MS (documented, not
