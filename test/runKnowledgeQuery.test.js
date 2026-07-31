@@ -20,7 +20,7 @@ process.env.RELATIVITY_API_BASE_URL = process.env.RELATIVITY_API_BASE_URL || 'ht
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { runKnowledgeQuery } = require('../services/runKnowledgeQuery');
+const { runKnowledgeQuery, liveSourcesFromSearchMatches, liveSourcesFromContentMessages } = require('../services/runKnowledgeQuery');
 const { buildGapIdempotencyKey } = require('../services/knowledgeGapKey');
 
 const CLIENT_ID = 'client-1';
@@ -894,4 +894,71 @@ test('a provider failure from Relativity (e.g. timeout) is fed back as a named e
 
   assert.deepEqual(openaiService.receivedToolResults[0], { status: 'error', reason: 'provider_timeout', message: 'network down' });
   assert.equal(result.answer, 'I could not search your email right now — please try again.');
+});
+
+// ─────────────────────────────────────────────
+// EL8 (LIVE_EMAIL_LOOKUP.md §6, security requirement: "verify no OAuth/
+// credential/hidden-recipient field ever appears in a rendered citation —
+// a dedicated test, not just code review"). Simulates a poisoned tool
+// result (as if Relativity's response were ever compromised or widened by
+// accident) and proves these pure mapping functions only ever pull the
+// allowlisted §6.2 fields — structural, since every field below is an
+// explicit property read, never an object spread of the input.
+// ─────────────────────────────────────────────
+
+const LIVE_SOURCE_ALLOWED_KEYS = ['type', 'subject', 'from', 'receivedAt', 'mailboxOwnerMemberId', 'providerMessageId', 'providerThreadId', 'deepLinkUrl', 'live'].sort();
+
+test('security: liveSourcesFromSearchMatches never propagates extra/sensitive fields from a poisoned match object', () => {
+  const poisoned = {
+    messageId: 'm1', threadId: 't1', subject: 'x', fromAddress: 'a@b.com', date: '2026-07-30T00:00:00Z',
+    snippet: 'x', deepLinkUrl: 'https://mail.google.com/mail/u/0/#all/m1',
+    accessToken: 'ya29.leaked', refreshToken: '1//leaked', oauthToken: 'leaked', credential: { secret: 'x' }, bcc: 'secret@b.com', rawPayload: { mime: 'raw' },
+  };
+  const sources = liveSourcesFromSearchMatches([poisoned], 'member-1');
+  assert.equal(sources.length, 1);
+  assert.deepEqual(Object.keys(sources[0]).sort(), LIVE_SOURCE_ALLOWED_KEYS);
+  assert.equal(JSON.stringify(sources[0]).includes('leaked'), false);
+});
+
+test('security: liveSourcesFromContentMessages never propagates extra/sensitive fields from a poisoned message object', () => {
+  const poisoned = {
+    messageId: 'm1', threadId: 't1', subject: 'x', fromAddress: 'a@b.com', date: '2026-07-30T00:00:00Z',
+    body: 'the actual body', truncated: false, deepLinkUrl: 'https://mail.google.com/mail/u/0/#all/m1',
+    accessToken: 'ya29.leaked', bcc: 'secret@b.com',
+  };
+  const sources = liveSourcesFromContentMessages([poisoned], 'member-1');
+  assert.equal(sources.length, 1);
+  assert.deepEqual(Object.keys(sources[0]).sort(), LIVE_SOURCE_ALLOWED_KEYS);
+  // The normalized message body itself must never appear in a citation —
+  // citations are metadata, not content, even though this function
+  // receives the full message it was derived from.
+  assert.equal(JSON.stringify(sources[0]).includes('the actual body'), false);
+  assert.equal(JSON.stringify(sources[0]).includes('leaked'), false);
+});
+
+test('security: a hybrid answer\'s full sources array (stored + live) never contains an access token even when the underlying tool result is poisoned', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([{ document_id: 'doc-1', metadata: { fileName: 'AcmeNotes.pdf' } }]);
+  const openaiService = createScriptedToolOpenaiService({
+    intent: intentWithGate(true),
+    toolScript: [
+      { type: 'tool_call', name: 'search_email_messages', args: {} },
+      { type: 'text', content: 'Per our notes and a recent email, the renewal is on track.' },
+    ],
+  });
+  const toolExecutionClient = createFakeToolExecutionClient({
+    search_email_messages: {
+      status: 'ok',
+      matches: [{ messageId: 'm1', threadId: 't1', subject: 'Renewal', fromAddress: 'a@acme.com', date: '2026-07-30T00:00:00Z', snippet: 'x', accessToken: 'ya29.leaked' }],
+      truncated: false,
+      accessToken: 'ya29.leaked-at-top-level',
+    },
+  });
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'What changed on the renewal?', memberId: MEMBER_ID,
+    emailLookupAvailable: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(result.sources.length, 2);
+  assert.equal(JSON.stringify(result.sources).includes('leaked'), false);
 });

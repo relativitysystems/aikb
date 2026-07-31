@@ -612,4 +612,11 @@ module.exports = {
   isKnowledgeGapAnswer,
   normalizeGapAnswerSource,
   isAdminRole,
+  // EL8 (LIVE_EMAIL_LOOKUP.md §6, security requirement: "verify no OAuth/
+  // credential/hidden-recipient field ever appears in a rendered citation
+  // — a dedicated test, not just code review") — exported so that
+  // guarantee can be asserted directly against these pure mapping
+  // functions, not only indirectly through the full orchestration loop.
+  liveSourcesFromSearchMatches,
+  liveSourcesFromContentMessages,
 };
