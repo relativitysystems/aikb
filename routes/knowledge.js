@@ -605,7 +605,7 @@ function resolveAskOrigin(origin) {
 router.post('/ask', requireServiceRequest, async (req, res, next) => {
   try {
     const { clientId, idempotencyKey } = req.serviceRequest;
-    const { question, originMetadata, allowedCollectionIds, origin } = req.servicePayload || {};
+    const { question, originMetadata, allowedCollectionIds, origin, memberId, emailLookupAvailable } = req.servicePayload || {};
 
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'question is required' });
@@ -637,6 +637,12 @@ router.post('/ask', requireServiceRequest, async (req, res, next) => {
         // migrations/006_knowledge_collections.sql for why an empty array
         // is safe (it matches nothing, not everything).
         allowedCollectionIds: Array.isArray(allowedCollectionIds) ? allowedCollectionIds : [],
+        // EL7B (LIVE_EMAIL_LOOKUP.md §3.2) — memberId is Relativity's own
+        // resolution via slack_user_links (a channel @mention never sets
+        // this, per §3.3 — always null/absent for those). Absent/falsy by
+        // default, matching every pre-EL7B caller of this route unchanged.
+        memberId: typeof memberId === 'string' ? memberId : null,
+        emailLookupAvailable: emailLookupAvailable === true,
       },
     });
 

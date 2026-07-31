@@ -501,7 +501,7 @@ const slackQuestionRequested = inngest.createFunction(
   },
   { event: 'knowledge/slack.question.requested' },
   async ({ event, step }) => {
-    const { clientId, question, idempotencyKey, origin, originMetadata, allowedCollectionIds } = event.data;
+    const { clientId, question, idempotencyKey, origin, originMetadata, allowedCollectionIds, memberId, emailLookupAvailable } = event.data;
 
     if (!clientId) throw new Error('clientId is required');
     if (!question) throw new Error('question is required');
@@ -527,6 +527,14 @@ const slackQuestionRequested = inngest.createFunction(
         // this idempotencyKey already happened upstream, at claim time in
         // routes/knowledge.js POST /ask.
         persistConversation: false,
+        // EL7B (LIVE_EMAIL_LOOKUP.md §3.2) — memberId/emailLookupAvailable
+        // are Relativity's own resolution (slack_user_links + the same
+        // isLiveLookupAvailable check the portal uses, EL6). Absent/false
+        // by default — every pre-EL7B event still enqueued with this exact
+        // shape (a channel @mention never sets these, per §3.3) behaves
+        // identically to before.
+        memberId: memberId || null,
+        emailLookupAvailable: emailLookupAvailable === true,
       });
     });
 
@@ -540,6 +548,15 @@ const slackQuestionRequested = inngest.createFunction(
           isKnowledgeGap: result.isKnowledgeGap,
           gapReason: result.gapReason || null,
           sessionId: result.sessionId,
+          // EL7B (§3.2 — "an unlinked user gets the link-prompt, never a
+          // silent failure"): true when the classifier thought this
+          // question might need live email but no tools were ever offered
+          // because emailLookupAvailable was false (unlinked Slack user, or
+          // a linked one with no active/consented mailbox). Relativity's
+          // slackDeliverService.js appends a link-prompt hint when set —
+          // narrow signal only, never the full intent object (no unrelated
+          // classifier detail crosses this boundary).
+          emailLookupSuggested: Boolean(result.intent && result.intent.mayNeedLiveEmailLookup) && !emailLookupAvailable,
         },
       });
     });
