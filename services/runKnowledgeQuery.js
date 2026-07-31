@@ -43,9 +43,12 @@
 // on every question). Product decision: still store the real question text
 // on a detected gap, for both origins, unchanged by this milestone.
 
+const crypto = require('crypto');
 const config = require('../config');
 const defaultSupabaseService = require('./supabaseService');
 const defaultOpenaiService = require('./openaiService');
+const defaultToolExecutionClient = require('./toolExecutionClient');
+const { SEARCH_EMAIL_MESSAGES_TOOL, GET_EMAIL_CONTENT_TOOL, TOOL_NAMES } = require('./emailToolSchemas');
 const { buildGapIdempotencyKey } = require('./knowledgeGapKey');
 
 function isAdminRole(role) {
@@ -128,6 +131,154 @@ async function replayExistingSession({ supabaseService, clientId, session }) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// EL5 — bounded live-email tool orchestration (Architecture/architecture/
+// LIVE_EMAIL_LOOKUP.md §1.1 steps 5-13, §1.3 Option C, ADR-010 Conformance's
+// confirmed two-call bound, §6.2's source shape).
+// ---------------------------------------------------------------------------
+
+/**
+ * §6.2 — maps a search_email_messages match into the shared live-source
+ * shape. Used both when the model answers directly from search snippets
+ * (no fetch needed — the common case) and, for whichever result actually
+ * got fetched, superseded by liveSourcesFromContentMessages below.
+ */
+function liveSourcesFromSearchMatches(matches, memberId) {
+  return (matches || []).map((m) => ({
+    type: 'live_email_message',
+    subject: m.subject,
+    from: m.fromAddress,
+    receivedAt: m.date,
+    mailboxOwnerMemberId: memberId,
+    providerMessageId: m.messageId,
+    providerThreadId: m.threadId || null,
+    deepLinkUrl: m.deepLinkUrl || null,
+    live: true,
+  }));
+}
+
+/**
+ * §6.2 — maps get_email_content's returned message(s) into live sources.
+ * More than one message back (a fetched thread) is reported as
+ * live_email_thread; a single message (either a lone messageId fetch or a
+ * one-message thread) is live_email_message — a simplification EL8
+ * ("Citations and live-source UI") owns refining further, not required by
+ * this milestone's own scope.
+ */
+function liveSourcesFromContentMessages(messages, memberId) {
+  const type = (messages || []).length > 1 ? 'live_email_thread' : 'live_email_message';
+  return (messages || []).map((m) => ({
+    type,
+    subject: m.subject,
+    from: m.fromAddress,
+    receivedAt: m.date,
+    mailboxOwnerMemberId: memberId,
+    providerMessageId: m.messageId,
+    providerThreadId: m.threadId || null,
+    deepLinkUrl: m.deepLinkUrl || null,
+    live: true,
+  }));
+}
+
+/**
+ * The bounded, two-stage tool-calling loop. The ADR-010 Conformance section's
+ * confirmed maximum (search, optionally then one fetch, never more) is
+ * enforced STRUCTURALLY, not by counting calls at runtime: call 1 is offered
+ * ONLY search_email_messages, call 2 (if reached) is offered ONLY
+ * get_email_content, and the final call (if reached) is offered no tools at
+ * all — the model cannot request a third call, cannot fetch before
+ * searching, and cannot search twice, because the schema it is given each
+ * time never allows it.
+ *
+ * A get_email_content request for an id search_email_messages did not
+ * actually return is rejected locally (never sent to Relativity) — the
+ * spec's "cannot call get_email_content for an id it did not receive from
+ * Call 1" requirement.
+ *
+ * Deliberately NOT implemented here (§8.3's "Deduplication against
+ * already-retrieved ingested emails" token-control optimization — checking
+ * email_source_messages for a providerMessageId before fetching live): a
+ * cost optimization, not part of this milestone's stated Objective/Security
+ * requirements/Tests, left for a follow-up once real usage data justifies it.
+ *
+ * @returns {Promise<{answer:string, liveSources:object[]}>}
+ */
+async function runEmailToolAugmentedGeneration({
+  openaiService, toolExecutionClient, clientId, memberId, origin, originMetadata, question, enrichedChunks, recentSessionMessages,
+}) {
+  const first = await openaiService.generateRagAnswerWithTools(question, enrichedChunks, recentSessionMessages, [SEARCH_EMAIL_MESSAGES_TOOL]);
+  if (first.type === 'text') {
+    return { answer: first.content, liveSources: [] };
+  }
+  if (first.toolCall.name !== TOOL_NAMES.SEARCH_EMAIL_MESSAGES) {
+    // Structurally unreachable (search_email_messages is the only tool
+    // offered this call) — defensive fallback only.
+    return { answer: 'I ran into an issue searching your email — please try rephrasing your question.', liveSources: [] };
+  }
+
+  const searchResult = await toolExecutionClient
+    .executeTool({
+      clientId,
+      requestingMemberId: memberId,
+      origin,
+      originMetadata,
+      idempotencyKey: crypto.randomUUID(),
+      toolName: TOOL_NAMES.SEARCH_EMAIL_MESSAGES,
+      args: first.toolCall.args,
+    })
+    .catch((err) => ({ status: 'error', reason: 'provider_timeout', message: err.message }));
+
+  const knownIds = new Set();
+  for (const m of searchResult.matches || []) {
+    if (m.messageId) knownIds.add(m.messageId);
+    if (m.threadId) knownIds.add(m.threadId);
+  }
+
+  const second = await openaiService.continueRagAnswerWithToolResult({
+    priorMessages: first.conversationMessages,
+    toolCall: first.toolCall,
+    toolResult: searchResult,
+    tools: [GET_EMAIL_CONTENT_TOOL],
+  });
+
+  if (second.type === 'text') {
+    const liveSources = searchResult.status === 'ok' ? liveSourcesFromSearchMatches(searchResult.matches, memberId) : [];
+    return { answer: second.content, liveSources };
+  }
+  if (second.toolCall.name !== TOOL_NAMES.GET_EMAIL_CONTENT) {
+    // Structurally unreachable — defensive fallback only.
+    return { answer: 'I ran into an issue reading that email — please try rephrasing your question.', liveSources: [] };
+  }
+
+  const requestedId = second.toolCall.args.messageId || second.toolCall.args.threadId;
+  const idIsKnown = Boolean(requestedId) && knownIds.has(requestedId);
+
+  const contentResult = idIsKnown
+    ? await toolExecutionClient
+        .executeTool({
+          clientId,
+          requestingMemberId: memberId,
+          origin,
+          originMetadata,
+          idempotencyKey: crypto.randomUUID(),
+          toolName: TOOL_NAMES.GET_EMAIL_CONTENT,
+          args: second.toolCall.args,
+        })
+        .catch((err) => ({ status: 'error', reason: 'provider_timeout', message: err.message }))
+    : { status: 'error', reason: 'validation_error' };
+
+  // Final call: no tools offered — structurally the last call this turn can make.
+  const final = await openaiService.continueRagAnswerWithToolResult({
+    priorMessages: second.conversationMessages,
+    toolCall: second.toolCall,
+    toolResult: contentResult,
+    tools: undefined,
+  });
+
+  const liveSources = contentResult.status === 'ok' ? liveSourcesFromContentMessages(contentResult.messages, memberId) : [];
+  return { answer: final.type === 'text' ? final.content : '', liveSources };
+}
+
 /**
  * @param {object} params
  * @param {string} params.clientId
@@ -139,6 +290,7 @@ async function replayExistingSession({ supabaseService, clientId, session }) {
  * @param {string|null} [params.idempotencyKey] - Slack: "slack:<event_id>". Never used for portal today.
  * @param {string[]|null} [params.allowedCollectionIds] - null = no restriction (portal default); an array (possibly empty) restricts retrieval.
  * @param {boolean} [params.persistConversation] - Backlog M13 (revised): default true (portal, unchanged). false means NO knowledge_chat_sessions row and NO knowledge_chat_messages rows are ever created for this call — used by the Slack ask path (both 'slack' and 'slack_dm') so Slack-originated conversations are never persisted. The idempotency-based session-replay short-circuit is skipped in this mode (dedup for Slack instead lives in routes/knowledge.js POST /ask, backed by knowledge_slack_request_log — see services/slackRequestLogService.js — since there is no session to replay from). Knowledge-gap auto-persist (persistGapBestEffort, below) is NOT gated by this flag: a detected gap still stores the real question text, unchanged, per product decision (knowledge_gaps is review-queue data, never exposed through any portal chat/session read path).
+ * @param {boolean} [params.emailLookupAvailable] - EL5 (LIVE_EMAIL_LOOKUP.md §1.1 step 4). Relativity-supplied: whether the requesting member currently has an active, live-lookup-enabled Gmail connection. Default false (the caller-not-set default before EL6 wires this up from a real signal). Combined with classifyQueryIntent's mayNeedLiveEmailLookup as the two-stage gate (§1.3 Option C) — both must be true for the model to ever be offered the email tools.
  * @param {object} [params.deps] - DI'd for tests; each defaults to the real singleton service.
  */
 async function runKnowledgeQuery({
@@ -152,10 +304,12 @@ async function runKnowledgeQuery({
   idempotencyKey = null,
   allowedCollectionIds = null,
   persistConversation = true,
+  emailLookupAvailable = false,
   deps = {},
 }) {
   const supabaseService = deps.supabaseService || defaultSupabaseService;
   const openaiService = deps.openaiService || defaultOpenaiService;
+  const toolExecutionClient = deps.toolExecutionClient || defaultToolExecutionClient;
 
   if (!clientId) throw new Error('runKnowledgeQuery requires clientId');
   if (!question) throw new Error('runKnowledgeQuery requires question');
@@ -224,6 +378,12 @@ async function runKnowledgeQuery({
     runRetrieval = await supabaseService.hasIndexedDocuments(clientId);
   }
 
+  // EL5 (§1.3 Option C) — the two-stage gate: both the classifier's own
+  // signal AND Relativity's emailLookupAvailable must pass. A member with
+  // no live-lookup-enabled connection never has the tools offered
+  // regardless of what the classifier thinks the question is about.
+  const emailToolsAvailable = Boolean(intent.mayNeedLiveEmailLookup) && Boolean(emailLookupAvailable) && Boolean(memberId);
+
   console.log('[runKnowledgeQuery] intent classification', {
     clientId,
     origin,
@@ -232,6 +392,9 @@ async function runKnowledgeQuery({
     confidence: intent.confidence,
     classifierShouldRunRetrieval: intent.shouldRunRetrieval,
     retrievalSkipped: !runRetrieval,
+    mayNeedLiveEmailLookup: Boolean(intent.mayNeedLiveEmailLookup),
+    emailLookupAvailable: Boolean(emailLookupAvailable),
+    emailToolsOffered: emailToolsAvailable,
   });
 
   if (!runRetrieval) {
@@ -297,7 +460,13 @@ async function runKnowledgeQuery({
         return email ? { ...c, metadata: { ...c.metadata, email } } : c;
       });
 
-  if (!chunks.length) {
+  // EL5 — when live email tools are offered, zero stored chunks no longer
+  // means an immediate gap answer: the model still gets a chance to answer
+  // via a live mailbox search (LIVE_EMAIL_LOOKUP.md §1.1's "Live email
+  // lookup only" sequence — retrieval runs, 0 relevant chunks, generation
+  // still proceeds with tools=[...]). Every client without live lookup
+  // available takes the exact unchanged shortcut below.
+  if (!chunks.length && !emailToolsAvailable) {
     const answer = normalizeGapAnswerSource('I couldn\'t find any relevant information in the knowledge base for your question.');
     if (persistConversation) {
       await supabaseService.createChatMessage({
@@ -317,7 +486,17 @@ async function runKnowledgeQuery({
     return { answer, sources: [], sessionId, isKnowledgeGap: true, gapReason: 'no_chunks_found', userMessageId: userMsg ? userMsg.id : null, intent };
   }
 
-  const answer = await openaiService.generateRagAnswer(question, enrichedChunks, recentSessionMessages);
+  let answer;
+  let liveSources = [];
+  if (emailToolsAvailable) {
+    const toolAugmented = await runEmailToolAugmentedGeneration({
+      openaiService, toolExecutionClient, clientId, memberId, origin, originMetadata, question, enrichedChunks, recentSessionMessages,
+    });
+    answer = toolAugmented.answer;
+    liveSources = toolAugmented.liveSources;
+  } else {
+    answer = await openaiService.generateRagAnswer(question, enrichedChunks, recentSessionMessages);
+  }
 
   // EM10 (§23) — an email-sourced document (chunk.metadata.email, set by
   // the enrichment above) gets a distinct citation shape from a plain
@@ -379,7 +558,13 @@ async function runKnowledgeQuery({
     chunkCount: chunks.length,
     documentIds: [...new Set(chunks.map((c) => c.document_id))],
   };
-  const isGap = isKnowledgeGapAnswer(answer);
+  // EL5 — a live source means the model demonstrably found an answer
+  // outside stored knowledge; isKnowledgeGapAnswer's phrase-matching (tuned
+  // for a stored-context-only answer) is never consulted once that's true,
+  // so a correct live-email answer can never be misclassified as "not
+  // documented in the knowledge base."
+  const isGap = liveSources.length === 0 && isKnowledgeGapAnswer(answer);
+  const allSources = [...sources, ...liveSources];
 
   if (isGap) {
     const normalizedAnswer = normalizeGapAnswerSource(answer);
@@ -407,13 +592,13 @@ async function runKnowledgeQuery({
       sessionId,
       role: 'assistant',
       content: answer,
-      sources,
+      sources: allSources,
       metadata: { ...chunkMetadata, intent, retrievalSkipped: false, isKnowledgeGap: false },
       memberId,
     });
   }
 
-  return { answer, sources, sessionId, isKnowledgeGap: false, userMessageId: userMsg ? userMsg.id : null, intent };
+  return { answer, sources: allSources, sessionId, isKnowledgeGap: false, userMessageId: userMsg ? userMsg.id : null, intent };
 }
 
 module.exports = {

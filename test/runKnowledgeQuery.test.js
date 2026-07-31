@@ -1,5 +1,23 @@
 'use strict';
 
+// Pre-existing gap fixed here rather than left for a later pass: this file
+// requires services/runKnowledgeQuery.js (which pulls in config/index.js's
+// require_env checks) but, unlike its sibling test files (e.g.
+// toolExecutionClient.test.js), never set the env vars config/index.js
+// needs to not throw at require time. Harmless in isolation (env vars
+// leaking from another test file's process happened to mask this when run
+// via certain invocations) but a real gap when this file runs on its own
+// or first in process-isolated `node --test`. Same var set/values as
+// toolExecutionClient.test.js's own bootstrap block.
+process.env.AIKB_SUPABASE_URL = process.env.AIKB_SUPABASE_URL || 'https://example.supabase.co';
+process.env.AIKB_SUPABASE_SERVICE_KEY = process.env.AIKB_SUPABASE_SERVICE_KEY || 'test-key';
+process.env.GLOBAL_SUPABASE_URL = process.env.GLOBAL_SUPABASE_URL || 'https://example.supabase.co';
+process.env.GLOBAL_SUPABASE_SERVICE_KEY = process.env.GLOBAL_SUPABASE_SERVICE_KEY || 'test-key';
+process.env.OPENAI_API_KEY = process.env.OPENAI_API_KEY || 'test-openai-key';
+process.env.API_KEY = process.env.API_KEY || 'test-api-key';
+process.env.SERVICE_REQUEST_SIGNING_SECRET = process.env.SERVICE_REQUEST_SIGNING_SECRET || 'test-service-request-secret';
+process.env.RELATIVITY_API_BASE_URL = process.env.RELATIVITY_API_BASE_URL || 'https://relativity.example.internal';
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { runKnowledgeQuery } = require('../services/runKnowledgeQuery');
@@ -499,4 +517,341 @@ test('persistConversation: false skips the idempotency-based session-replay shor
 
   assert.equal(openaiService.calls.classifyQueryIntent, 2, 'no session exists to replay from, so the pipeline runs on every call');
   assert.equal(second.replayed, undefined);
+});
+
+// ─────────────────────────────────────────────
+// EL5 — bounded live-email tool orchestration
+// (Architecture/architecture/LIVE_EMAIL_LOOKUP.md §1, §1.3 Option C,
+// ADR-010 Conformance's confirmed two-call bound)
+// ─────────────────────────────────────────────
+
+const MEMBER_ID = 'member-1';
+
+function intentWithGate(mayNeedLiveEmailLookup, overrides = {}) {
+  return { intent: 'knowledge_query', confidence: 0.9, shouldRunRetrieval: true, mayNeedLiveEmailLookup, reason: 'test', ...overrides };
+}
+
+/**
+ * A scripted fake covering classifyQueryIntent/generateRagAnswer (the
+ * unchanged no-tools path) AND the two new EL5 tools-aware functions.
+ * `toolScript` drives generateRagAnswerWithTools/continueRagAnswerWithToolResult
+ * in call order: each entry is either {type:'text', content} (answer
+ * immediately, no further calls) or {type:'tool_call', name, args}
+ * (request a tool, continuing the script on the next orchestration call).
+ * conversationMessages carries a minimal, opaque marker forward — nothing
+ * in the orchestrator inspects its shape beyond passing it back to the next
+ * call, mirroring the real OpenAI message-array contract.
+ */
+function createScriptedToolOpenaiService({ intent, ragAnswer = 'stored-only answer', toolScript = [] }) {
+  let step = 0;
+  const calls = { classifyQueryIntent: 0, generateRagAnswer: 0, generateRagAnswerWithTools: 0, continueRagAnswerWithToolResult: 0 };
+  const receivedToolResults = [];
+  const offeredToolsPerCall = [];
+
+  function nextResult(tools) {
+    offeredToolsPerCall.push((tools || []).map((t) => t.function.name));
+    const scripted = toolScript[step];
+    step += 1;
+    if (!scripted || scripted.type === 'text') {
+      return { type: 'text', content: (scripted && scripted.content) || ragAnswer };
+    }
+    return {
+      type: 'tool_call',
+      conversationMessages: [{ marker: `after-call-${step}` }],
+      toolCall: { id: `call-${step}`, name: scripted.name, args: scripted.args || {} },
+    };
+  }
+
+  return {
+    calls,
+    receivedToolResults,
+    offeredToolsPerCall,
+    async classifyQueryIntent() {
+      calls.classifyQueryIntent += 1;
+      return intent;
+    },
+    buildNonRetrievalAnswer(question, intentArg) {
+      return `Non-retrieval answer for: ${question} (${intentArg.intent})`;
+    },
+    async buildRetrievalQuery(question) { return question; },
+    async embedQuery() { return [0.1, 0.2, 0.3]; },
+    async generateRagAnswer() {
+      calls.generateRagAnswer += 1;
+      return ragAnswer;
+    },
+    async generateRagAnswerWithTools(question, chunks, sessionMessages, tools) {
+      calls.generateRagAnswerWithTools += 1;
+      return nextResult(tools);
+    },
+    async continueRagAnswerWithToolResult({ toolResult, tools }) {
+      calls.continueRagAnswerWithToolResult += 1;
+      receivedToolResults.push(toolResult);
+      return nextResult(tools);
+    },
+  };
+}
+
+function createFakeToolExecutionClient(responsesByToolName = {}) {
+  const calls = [];
+  return {
+    calls,
+    async executeTool(params) {
+      calls.push(params);
+      const responder = responsesByToolName[params.toolName];
+      if (typeof responder === 'function') return responder(params);
+      return responder || { status: 'ok', matches: [] };
+    },
+  };
+}
+
+function baseSupabaseServiceWithChunks(chunks = []) {
+  const supabaseService = createFakeSupabaseService();
+  supabaseService.searchChunksWithTitleBoost = async () => ({ chunks, matchedDocumentIds: [] });
+  return supabaseService;
+}
+
+test('gate-closed (classifier says no): generateRagAnswerWithTools/executeTool are never reached, plain generateRagAnswer is used', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([{ document_id: 'doc-1', metadata: { fileName: 'PTO.pdf' } }]);
+  // Deliberately the OLD fixture (no generateRagAnswerWithTools defined) —
+  // if the orchestrator incorrectly tried the tools path, this throws.
+  const openaiService = createFakeOpenaiService({ intent: intentWithGate(false), ragAnswer: 'PTO answer' });
+  const toolExecutionClient = createFakeToolExecutionClient();
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'What is our PTO policy?', memberId: MEMBER_ID,
+    emailLookupAvailable: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(openaiService.calls.generateRagAnswer, 1);
+  assert.equal(toolExecutionClient.calls.length, 0);
+  assert.equal(result.answer, 'PTO answer');
+  assert.equal(result.isKnowledgeGap, false);
+});
+
+test('gate-closed with zero stored chunks: the unchanged immediate gap shortcut fires, generateRagAnswer is never even called', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([]);
+  const openaiService = createFakeOpenaiService({ intent: intentWithGate(false) });
+  const toolExecutionClient = createFakeToolExecutionClient();
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'What is our PTO policy?', memberId: MEMBER_ID,
+    emailLookupAvailable: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(openaiService.calls.generateRagAnswer, 0);
+  assert.equal(toolExecutionClient.calls.length, 0);
+  assert.equal(result.isKnowledgeGap, true);
+  assert.equal(result.gapReason, 'no_chunks_found');
+});
+
+test('gate-closed (emailLookupAvailable false): classifier says yes but Relativity says no connection -> tools never offered', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([{ document_id: 'doc-1', metadata: { fileName: 'PTO.pdf' } }]);
+  const openaiService = createFakeOpenaiService({ intent: intentWithGate(true), ragAnswer: 'PTO answer' });
+  const toolExecutionClient = createFakeToolExecutionClient();
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'Did Sarah reply about PTO?', memberId: MEMBER_ID,
+    emailLookupAvailable: false, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(openaiService.calls.generateRagAnswer, 1);
+  assert.equal(toolExecutionClient.calls.length, 0);
+  assert.equal(result.answer, 'PTO answer');
+});
+
+test('gate-closed (no memberId): tools never offered even if both other signals are true', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([{ document_id: 'doc-1', metadata: { fileName: 'PTO.pdf' } }]);
+  const openaiService = createFakeOpenaiService({ intent: intentWithGate(true) });
+  const toolExecutionClient = createFakeToolExecutionClient();
+
+  await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'Search my email', memberId: null,
+    emailLookupAvailable: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(openaiService.calls.generateRagAnswer, 1);
+  assert.equal(toolExecutionClient.calls.length, 0);
+});
+
+test('gate-open, no call: the model answers directly from stored context; tools were offered but never invoked', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([{ document_id: 'doc-1', metadata: { fileName: 'PTO.pdf' } }]);
+  const openaiService = createScriptedToolOpenaiService({
+    intent: intentWithGate(true),
+    toolScript: [{ type: 'text', content: 'You get 15 days of PTO, per our handbook.' }],
+  });
+  const toolExecutionClient = createFakeToolExecutionClient();
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'What is our PTO policy?', memberId: MEMBER_ID,
+    emailLookupAvailable: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(openaiService.calls.generateRagAnswerWithTools, 1);
+  assert.equal(openaiService.calls.continueRagAnswerWithToolResult, 0);
+  assert.equal(toolExecutionClient.calls.length, 0);
+  assert.equal(result.answer, 'You get 15 days of PTO, per our handbook.');
+  assert.deepEqual(result.sources, [{ fileName: 'PTO.pdf', documentId: 'doc-1' }]);
+  assert.equal(result.isKnowledgeGap, false);
+});
+
+test('single tool call (search only): call 1 offers only search_email_messages; a text answer after the search result stops the loop at one Relativity call', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([]); // live-only case, no stored chunks
+  const openaiService = createScriptedToolOpenaiService({
+    intent: intentWithGate(true),
+    toolScript: [
+      { type: 'tool_call', name: 'search_email_messages', args: { senderContains: 'sarah@acme.com' } },
+      { type: 'text', content: 'Sarah replied this morning about the renewal.' },
+    ],
+  });
+  const searchMatches = [{ messageId: 'm1', threadId: 't1', subject: 'Re: renewal', fromAddress: 'sarah@acme.com', date: '2026-07-30T00:00:00Z', snippet: 'x', deepLinkUrl: 'https://mail.google.com/mail/u/0/#all/m1' }];
+  const toolExecutionClient = createFakeToolExecutionClient({
+    search_email_messages: { status: 'ok', matches: searchMatches, truncated: false },
+  });
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'Did Sarah reply about the renewal?', memberId: MEMBER_ID,
+    emailLookupAvailable: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(toolExecutionClient.calls.length, 1);
+  assert.equal(toolExecutionClient.calls[0].toolName, 'search_email_messages');
+  assert.equal(toolExecutionClient.calls[0].requestingMemberId, MEMBER_ID);
+  // Call 1 is structurally offered ONLY search_email_messages.
+  assert.deepEqual(openaiService.offeredToolsPerCall[0], ['search_email_messages']);
+  assert.equal(result.answer, 'Sarah replied this morning about the renewal.');
+  assert.deepEqual(result.sources, [{
+    type: 'live_email_message', subject: 'Re: renewal', from: 'sarah@acme.com', receivedAt: '2026-07-30T00:00:00Z',
+    mailboxOwnerMemberId: MEMBER_ID, providerMessageId: 'm1', providerThreadId: 't1',
+    deepLinkUrl: 'https://mail.google.com/mail/u/0/#all/m1', live: true,
+  }]);
+  assert.equal(result.isKnowledgeGap, false);
+});
+
+test('two-call search-then-fetch: call 2 offers only get_email_content for an id call 1 actually returned; exactly 2 Relativity calls total', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([]);
+  const openaiService = createScriptedToolOpenaiService({
+    intent: intentWithGate(true),
+    toolScript: [
+      { type: 'tool_call', name: 'search_email_messages', args: {} },
+      { type: 'tool_call', name: 'get_email_content', args: { messageId: 'm1' } },
+      { type: 'text', content: 'The customer asked for a 10% discount on renewal.' },
+    ],
+  });
+  const toolExecutionClient = createFakeToolExecutionClient({
+    search_email_messages: { status: 'ok', matches: [{ messageId: 'm1', threadId: 't1', subject: 'Acme thread', fromAddress: 'a@acme.com', date: '2026-07-30T00:00:00Z', snippet: 'x' }], truncated: false },
+    get_email_content: { status: 'ok', messages: [{ messageId: 'm1', threadId: 't1', subject: 'Acme thread', fromAddress: 'a@acme.com', date: '2026-07-30T00:00:00Z', body: 'full body', truncated: false, deepLinkUrl: 'https://mail.google.com/mail/u/0/#all/m1' }] },
+  });
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'What exactly did the customer say in the latest Acme thread?', memberId: MEMBER_ID,
+    emailLookupAvailable: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(toolExecutionClient.calls.length, 2);
+  assert.equal(toolExecutionClient.calls[0].toolName, 'search_email_messages');
+  assert.equal(toolExecutionClient.calls[1].toolName, 'get_email_content');
+  // Call 2 is structurally offered ONLY get_email_content; the final call offers no tools at all.
+  assert.deepEqual(openaiService.offeredToolsPerCall[1], ['get_email_content']);
+  assert.deepEqual(openaiService.offeredToolsPerCall[2], []);
+  assert.equal(result.answer, 'The customer asked for a 10% discount on renewal.');
+  assert.equal(result.sources.length, 1);
+  assert.equal(result.sources[0].type, 'live_email_message');
+  assert.equal(result.sources[0].providerMessageId, 'm1');
+});
+
+test('bound enforcement: a get_email_content request for an id search never returned is rejected locally, never reaches Relativity a second time', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([]);
+  const openaiService = createScriptedToolOpenaiService({
+    intent: intentWithGate(true),
+    toolScript: [
+      { type: 'tool_call', name: 'search_email_messages', args: {} },
+      { type: 'tool_call', name: 'get_email_content', args: { messageId: 'unrelated-id-the-model-hallucinated' } },
+      { type: 'text', content: 'I could not find that specific message.' },
+    ],
+  });
+  const toolExecutionClient = createFakeToolExecutionClient({
+    search_email_messages: { status: 'ok', matches: [{ messageId: 'm1', threadId: 't1', subject: 'x', fromAddress: 'a@b.com', date: '2026-07-30T00:00:00Z', snippet: 'x' }], truncated: false },
+  });
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'Fetch that other message', memberId: MEMBER_ID,
+    emailLookupAvailable: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  // Only the search call actually reached Relativity — the fetch for an
+  // unknown id was rejected locally, per ADR-010 Conformance's "cannot call
+  // get_email_content for an id it did not receive from Call 1."
+  assert.equal(toolExecutionClient.calls.length, 1);
+  assert.deepEqual(openaiService.receivedToolResults[1], { status: 'error', reason: 'validation_error' });
+  assert.equal(result.sources.length, 0); // no successful content fetch -> no live source
+  // No live source came through, so the final text's "could not find"
+  // phrasing correctly falls back to ordinary knowledge-gap handling
+  // (isKnowledgeGapAnswer/normalizeGapAnswerSource, unchanged from before EL5).
+  assert.equal(result.isKnowledgeGap, true);
+  assert.match(result.answer, /I could not find that specific message/);
+});
+
+test('hybrid source-merging: a stored-document source and a live-email source both appear in the same answer', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([{ document_id: 'doc-1', metadata: { fileName: 'AcmeNotes.pdf' } }]);
+  const openaiService = createScriptedToolOpenaiService({
+    intent: intentWithGate(true),
+    toolScript: [
+      { type: 'tool_call', name: 'search_email_messages', args: { subjectContains: 'Acme' } },
+      { type: 'text', content: 'Per our notes and a recent email, the Acme renewal is on track.' },
+    ],
+  });
+  const toolExecutionClient = createFakeToolExecutionClient({
+    search_email_messages: { status: 'ok', matches: [{ messageId: 'm1', threadId: 't1', subject: 'Acme renewal', fromAddress: 'a@acme.com', date: '2026-07-30T00:00:00Z', snippet: 'x', deepLinkUrl: 'https://mail.google.com/mail/u/0/#all/m1' }], truncated: false },
+  });
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'What\'s changed on the Acme renewal since our notes?', memberId: MEMBER_ID,
+    emailLookupAvailable: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(result.sources.length, 2);
+  assert.ok(result.sources.some((s) => s.fileName === 'AcmeNotes.pdf'));
+  assert.ok(result.sources.some((s) => s.type === 'live_email_message' && s.providerMessageId === 'm1'));
+});
+
+test('a live source suppresses knowledge-gap classification even if the final text uses gap-like phrasing', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([]);
+  const openaiService = createScriptedToolOpenaiService({
+    intent: intentWithGate(true),
+    toolScript: [
+      { type: 'tool_call', name: 'search_email_messages', args: {} },
+      { type: 'text', content: 'I could not find this in the knowledge base, but a live email from Sarah confirms it.' },
+    ],
+  });
+  const toolExecutionClient = createFakeToolExecutionClient({
+    search_email_messages: { status: 'ok', matches: [{ messageId: 'm1', threadId: 't1', subject: 'x', fromAddress: 'sarah@acme.com', date: '2026-07-30T00:00:00Z', snippet: 'x' }], truncated: false },
+  });
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'Did Sarah confirm the date?', memberId: MEMBER_ID,
+    emailLookupAvailable: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(result.isKnowledgeGap, false);
+  assert.equal(result.sources.length, 1);
+});
+
+test('a provider failure from Relativity (e.g. timeout) is fed back as a named error result, never thrown', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([]);
+  const openaiService = createScriptedToolOpenaiService({
+    intent: intentWithGate(true),
+    toolScript: [
+      { type: 'tool_call', name: 'search_email_messages', args: {} },
+      { type: 'text', content: 'I could not search your email right now — please try again.' },
+    ],
+  });
+  const toolExecutionClient = { async executeTool() { throw new Error('network down'); } };
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'Search my email for the contract', memberId: MEMBER_ID,
+    emailLookupAvailable: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.deepEqual(openaiService.receivedToolResults[0], { status: 'error', reason: 'provider_timeout', message: 'network down' });
+  assert.equal(result.answer, 'I could not search your email right now — please try again.');
 });
