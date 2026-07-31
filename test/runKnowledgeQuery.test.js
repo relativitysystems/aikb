@@ -673,6 +673,46 @@ test('gate-closed (no memberId): tools never offered even if both other signals 
   assert.equal(toolExecutionClient.calls.length, 0);
 });
 
+// ─────────────────────────────────────────────
+// EL6 — forceLiveLookup (the portal's "Live email" mode, §2.1): bypasses
+// the classifier's own mayNeedLiveEmailLookup signal specifically, but
+// never any other gate.
+// ─────────────────────────────────────────────
+
+test('forceLiveLookup bypasses the classifier\'s mayNeedLiveEmailLookup=false and offers the tools anyway', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([]);
+  const openaiService = createScriptedToolOpenaiService({
+    intent: intentWithGate(false), // classifier itself says no
+    toolScript: [{ type: 'tool_call', name: 'search_email_messages', args: {} }, { type: 'text', content: 'Found it live.' }],
+  });
+  const toolExecutionClient = createFakeToolExecutionClient({
+    search_email_messages: { status: 'ok', matches: [{ messageId: 'm1', threadId: 't1', subject: 'x', fromAddress: 'a@b.com', date: '2026-07-30T00:00:00Z', snippet: 'x' }], truncated: false },
+  });
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'anything', memberId: MEMBER_ID,
+    emailLookupAvailable: true, forceLiveLookup: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(toolExecutionClient.calls.length, 1);
+  assert.equal(result.answer, 'Found it live.');
+});
+
+test('forceLiveLookup still requires emailLookupAvailable — a member with no live-lookup connection gets no tools even in Live email mode', async () => {
+  const supabaseService = baseSupabaseServiceWithChunks([{ document_id: 'doc-1', metadata: { fileName: 'PTO.pdf' } }]);
+  const openaiService = createFakeOpenaiService({ intent: intentWithGate(false), ragAnswer: 'stored answer' });
+  const toolExecutionClient = createFakeToolExecutionClient();
+
+  const result = await runKnowledgeQuery({
+    clientId: CLIENT_ID, question: 'anything', memberId: MEMBER_ID,
+    emailLookupAvailable: false, forceLiveLookup: true, deps: { supabaseService, openaiService, toolExecutionClient },
+  });
+
+  assert.equal(openaiService.calls.generateRagAnswer, 1);
+  assert.equal(toolExecutionClient.calls.length, 0);
+  assert.equal(result.answer, 'stored answer');
+});
+
 test('gate-open, no call: the model answers directly from stored context; tools were offered but never invoked', async () => {
   const supabaseService = baseSupabaseServiceWithChunks([{ document_id: 'doc-1', metadata: { fileName: 'PTO.pdf' } }]);
   const openaiService = createScriptedToolOpenaiService({

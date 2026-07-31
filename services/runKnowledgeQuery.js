@@ -290,7 +290,8 @@ async function runEmailToolAugmentedGeneration({
  * @param {string|null} [params.idempotencyKey] - Slack: "slack:<event_id>". Never used for portal today.
  * @param {string[]|null} [params.allowedCollectionIds] - null = no restriction (portal default); an array (possibly empty) restricts retrieval.
  * @param {boolean} [params.persistConversation] - Backlog M13 (revised): default true (portal, unchanged). false means NO knowledge_chat_sessions row and NO knowledge_chat_messages rows are ever created for this call — used by the Slack ask path (both 'slack' and 'slack_dm') so Slack-originated conversations are never persisted. The idempotency-based session-replay short-circuit is skipped in this mode (dedup for Slack instead lives in routes/knowledge.js POST /ask, backed by knowledge_slack_request_log — see services/slackRequestLogService.js — since there is no session to replay from). Knowledge-gap auto-persist (persistGapBestEffort, below) is NOT gated by this flag: a detected gap still stores the real question text, unchanged, per product decision (knowledge_gaps is review-queue data, never exposed through any portal chat/session read path).
- * @param {boolean} [params.emailLookupAvailable] - EL5 (LIVE_EMAIL_LOOKUP.md §1.1 step 4). Relativity-supplied: whether the requesting member currently has an active, live-lookup-enabled Gmail connection. Default false (the caller-not-set default before EL6 wires this up from a real signal). Combined with classifyQueryIntent's mayNeedLiveEmailLookup as the two-stage gate (§1.3 Option C) — both must be true for the model to ever be offered the email tools.
+ * @param {boolean} [params.emailLookupAvailable] - LIVE_EMAIL_LOOKUP.md §1.1 step 4. Relativity-supplied: whether the requesting member currently has an active, live-lookup-enabled, consented Gmail connection (services/emailLiveLookupService.js#isLiveLookupAvailable, EL6). Default false. Combined with classifyQueryIntent's mayNeedLiveEmailLookup as the two-stage gate (§1.3 Option C) — both must be true for the model to ever be offered the email tools, UNLESS forceLiveLookup is also set.
+ * @param {boolean} [params.forceLiveLookup] - EL6 (§2.1) — the portal's "Live email" mode: forces the gate open regardless of the classifier's own mayNeedLiveEmailLookup signal. Still fully subject to emailLookupAvailable and every downstream authorization gate (§1.1 step 8) — this only bypasses the classifier, never authorization.
  * @param {object} [params.deps] - DI'd for tests; each defaults to the real singleton service.
  */
 async function runKnowledgeQuery({
@@ -305,6 +306,7 @@ async function runKnowledgeQuery({
   allowedCollectionIds = null,
   persistConversation = true,
   emailLookupAvailable = false,
+  forceLiveLookup = false,
   deps = {},
 }) {
   const supabaseService = deps.supabaseService || defaultSupabaseService;
@@ -378,11 +380,15 @@ async function runKnowledgeQuery({
     runRetrieval = await supabaseService.hasIndexedDocuments(clientId);
   }
 
-  // EL5 (§1.3 Option C) — the two-stage gate: both the classifier's own
-  // signal AND Relativity's emailLookupAvailable must pass. A member with
-  // no live-lookup-enabled connection never has the tools offered
-  // regardless of what the classifier thinks the question is about.
-  const emailToolsAvailable = Boolean(intent.mayNeedLiveEmailLookup) && Boolean(emailLookupAvailable) && Boolean(memberId);
+  // EL5/EL6 (§1.3 Option C, §2.1) — the two-stage gate: both the
+  // classifier's own signal AND Relativity's emailLookupAvailable must
+  // pass, UNLESS forceLiveLookup (the portal's "Live email" mode) bypasses
+  // the classifier's signal specifically — emailLookupAvailable and every
+  // downstream authorization gate still fully apply either way. A member
+  // with no live-lookup-enabled/consented connection never has the tools
+  // offered regardless of mode or what the classifier thinks the question
+  // is about.
+  const emailToolsAvailable = (Boolean(intent.mayNeedLiveEmailLookup) || Boolean(forceLiveLookup)) && Boolean(emailLookupAvailable) && Boolean(memberId);
 
   console.log('[runKnowledgeQuery] intent classification', {
     clientId,

@@ -521,7 +521,7 @@ router.get('/stats/:clientId', requireServiceRequest, async (req, res, next) => 
 
 router.post('/query', requireMemberContext, async (req, res, next) => {
   try {
-    const { clientId, question, sessionId: providedSessionId, allowedCollectionIds } = req.body;
+    const { clientId, question, sessionId: providedSessionId, allowedCollectionIds, emailLookupAvailable, forceLiveLookup } = req.body;
     if (!clientId || !question) {
       return res.status(400).json({ error: 'clientId and question are required' });
     }
@@ -545,6 +545,14 @@ router.post('/query', requireMemberContext, async (req, res, next) => {
       // collection — this is the portal's unchanged default behavior. Only
       // an explicit array restricts retrieval.
       allowedCollectionIds: Array.isArray(allowedCollectionIds) ? allowedCollectionIds : null,
+      // EL6 (LIVE_EMAIL_LOOKUP.md §1.1 step 4, §2.1) — Relativity-computed
+      // signals, both default false when omitted (every pre-EL6 caller,
+      // and Slack's /ask below, unchanged). forceLiveLookup is the "Live
+      // email" mode override; still fully subject to runKnowledgeQuery's
+      // own emailLookupAvailable check and every downstream authorization
+      // gate — this flag only bypasses the classifier's own signal.
+      emailLookupAvailable: emailLookupAvailable === true,
+      forceLiveLookup: forceLiveLookup === true,
     });
 
     res.json(result);
