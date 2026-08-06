@@ -504,6 +504,17 @@ async function runKnowledgeQuery({
     answer = await openaiService.generateRagAnswer(question, enrichedChunks, recentSessionMessages);
   }
 
+  // EM10.5 Scenario 2 bug fix — the model reports which numbered context
+  // items (buildContextText's `[i] Source: ...`) it actually relied on via
+  // a trailing "Cited: [n, n]" line; strip that line from the answer before
+  // it's shown to a user or persisted, and keep the parsed indices to filter
+  // sourceMap below. citedIndices is empty (not an error) when no such line
+  // was found — e.g. every DI-faked test fixture in this repo's convention,
+  // or a model that didn't comply — and the filtering step below falls back
+  // to the pre-fix "every retrieved document" behavior in that case.
+  const { citedIndices, cleanedAnswer } = openaiService.extractCitedIndices(answer);
+  answer = cleanedAnswer;
+
   // EM10 (§23) — an email-sourced document (chunk.metadata.email, set by
   // the enrichment above) gets a distinct citation shape from a plain
   // uploaded document: subject/from/sentAt/deepLinkUrl instead of
@@ -514,9 +525,16 @@ async function runKnowledgeQuery({
   // Slack-originated answers, without that file needing an email-specific
   // branch of its own.
   const sourceMap = new Map();
-  for (const chunk of enrichedChunks) {
+  // EM10.5 Scenario 2 bug fix — tracks, per document, every 1-based
+  // buildContextText index its chunks appeared at, so the citedIndices
+  // parsed above can be validated against this query's own retrieved set
+  // before a document is trusted as "cited" (see filtering step below).
+  const docIdToContextIndices = new Map();
+  enrichedChunks.forEach((chunk, i) => {
     const docId = chunk.document_id;
     const email = chunk.metadata && chunk.metadata.email;
+    if (!docIdToContextIndices.has(docId)) docIdToContextIndices.set(docId, []);
+    docIdToContextIndices.get(docId).push(i + 1);
     if (!sourceMap.has(docId)) {
       if (email) {
         sourceMap.set(docId, {
@@ -536,7 +554,7 @@ async function runKnowledgeQuery({
     if (!email && chunk.metadata && chunk.metadata.pageNumber != null) {
       sourceMap.get(docId).pages.add(chunk.metadata.pageNumber);
     }
-  }
+  });
   const sources = Array.from(sourceMap.values()).map((s) => {
     if (s.type === 'email') {
       const src = {
@@ -558,6 +576,25 @@ async function runKnowledgeQuery({
     return src;
   });
 
+  // EM10.5 Scenario 2 bug fix — only keep sources the model actually cited
+  // (validated indices, see docIdToContextIndices above), not every document
+  // that merely cleared the vector-search threshold. citedDocumentIds stays
+  // empty, and this falls back to the full retrieved set, whenever
+  // citedIndices was empty (no parseable "Cited:" line) or every index it
+  // named was out of range for this query's own retrieved chunks — never
+  // worse than the pre-fix behavior, and exactly what every existing
+  // DI-faked test fixture (which never emits a "Cited:" line) already
+  // exercises. chunkMetadata.documentIds below is left unfiltered
+  // deliberately: it's the internal retrieval-candidate audit record, never
+  // surfaced as a citation to a user.
+  const citedDocumentIds = new Set();
+  for (const [docId, indices] of docIdToContextIndices) {
+    if (indices.some((idx) => citedIndices.has(idx))) citedDocumentIds.add(docId);
+  }
+  const materialSources = citedDocumentIds.size > 0
+    ? sources.filter((s) => citedDocumentIds.has(s.documentId))
+    : sources;
+
   const chunkMetadata = {
     question,
     retrievalQuery,
@@ -570,7 +607,7 @@ async function runKnowledgeQuery({
   // so a correct live-email answer can never be misclassified as "not
   // documented in the knowledge base."
   const isGap = liveSources.length === 0 && isKnowledgeGapAnswer(answer);
-  const allSources = [...sources, ...liveSources];
+  const allSources = [...materialSources, ...liveSources];
 
   if (isGap) {
     const normalizedAnswer = normalizeGapAnswerSource(answer);

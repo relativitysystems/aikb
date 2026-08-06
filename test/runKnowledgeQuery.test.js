@@ -22,6 +22,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { runKnowledgeQuery, liveSourcesFromSearchMatches, liveSourcesFromContentMessages } = require('../services/runKnowledgeQuery');
 const { buildGapIdempotencyKey } = require('../services/knowledgeGapKey');
+// extractCitedIndices (EM10.5 Scenario 2 bug fix) is pure/side-effect-free,
+// same convention as buildContextText/formatCitationDate — the fake
+// openaiService below uses the real implementation rather than re-faking
+// parsing logic that isn't itself the thing under test in most of these cases.
+const { extractCitedIndices } = require('../services/openaiService');
 
 const CLIENT_ID = 'client-1';
 
@@ -132,6 +137,7 @@ function createFakeOpenaiService(overrides = {}) {
       this.calls.generateRagAnswer += 1;
       return overrides.ragAnswer || 'You get 15 days of PTO per year.';
     },
+    extractCitedIndices,
   };
 }
 
@@ -245,6 +251,81 @@ test('a mixed result (one document chunk, one email chunk) returns both citation
   const email = result.sources.find((s) => s.documentId === 'doc-email-1');
   assert.deepEqual(doc, { fileName: 'Handbook.pdf', documentId: 'doc-1', pages: [5] });
   assert.equal(email.subject, 'Renewal');
+});
+
+// ─────────────────────────────────────────────
+// EM10.5 Scenario 2 bug fix — sources[] is filtered down to only what the
+// model actually cited (via its "Cited: [n, n]" line), not every retrieved
+// candidate. Falls back to the full retrieved set when no such line is
+// present (every test above exercises exactly that fallback, since
+// createFakeOpenaiService's default ragAnswer carries no Cited line).
+// ─────────────────────────────────────────────
+
+test('a Cited line naming only one of several retrieved documents filters sources down to just that one', async () => {
+  const supabaseService = createFakeSupabaseService();
+  supabaseService.searchChunksWithTitleBoost = async () => ({
+    chunks: [
+      { document_id: 'doc-1', similarity: 0.4, metadata: { fileName: 'Unrelated.pdf' } },
+      { document_id: 'doc-2', similarity: 0.9, metadata: { fileName: 'Weekly Sales Meeting Agenda.txt' } },
+      { document_id: 'doc-3', similarity: 0.3, metadata: { fileName: 'AlsoUnrelated.txt' } },
+    ],
+    matchedDocumentIds: [],
+  });
+  // [1]=doc-1, [2]=doc-2, [3]=doc-3, per buildContextText's ordering.
+  const openaiService = createFakeOpenaiService({ ragAnswer: 'The meeting is Thursday at 9am.\n\nSource: Weekly Sales Meeting Agenda.txt\nCited: [2]' });
+
+  const result = await runKnowledgeQuery({ clientId: CLIENT_ID, question: 'When is the weekly sales meeting?', origin: 'portal', deps: { supabaseService, openaiService } });
+
+  assert.equal(result.sources.length, 1);
+  assert.equal(result.sources[0].documentId, 'doc-2');
+  assert.doesNotMatch(result.answer, /Cited/, 'the machine-readable Cited line must never reach the user-visible/persisted answer');
+  assert.match(result.answer, /Source: Weekly Sales Meeting Agenda\.txt/, 'the human-readable Source line is left intact');
+});
+
+test('multiple cited indices keep all of the documents they map to', async () => {
+  const supabaseService = createFakeSupabaseService();
+  supabaseService.searchChunksWithTitleBoost = async () => ({
+    chunks: [
+      { document_id: 'doc-1', similarity: 0.9, metadata: { fileName: 'A.pdf' } },
+      { document_id: 'doc-2', similarity: 0.2, metadata: { fileName: 'Irrelevant.pdf' } },
+      { document_id: 'doc-3', similarity: 0.8, metadata: { fileName: 'B.pdf' } },
+    ],
+    matchedDocumentIds: [],
+  });
+  const openaiService = createFakeOpenaiService({ ragAnswer: 'Answer combining both.\n\nSource: A.pdf; B.pdf\nCited: [1, 3]' });
+
+  const result = await runKnowledgeQuery({ clientId: CLIENT_ID, question: 'q', origin: 'portal', deps: { supabaseService, openaiService } });
+
+  assert.deepEqual(result.sources.map((s) => s.documentId).sort(), ['doc-1', 'doc-3']);
+});
+
+test('an out-of-range Cited index (no matching retrieved chunk) falls back to the full retrieved set rather than silently dropping everything', async () => {
+  const supabaseService = createFakeSupabaseService();
+  supabaseService.searchChunksWithTitleBoost = async () => ({
+    chunks: [{ document_id: 'doc-1', similarity: 0.9, metadata: { fileName: 'Handbook.pdf' } }],
+    matchedDocumentIds: [],
+  });
+  const openaiService = createFakeOpenaiService({ ragAnswer: 'Answer.\n\nSource: Handbook.pdf\nCited: [99]' });
+
+  const result = await runKnowledgeQuery({ clientId: CLIENT_ID, question: 'q', origin: 'portal', deps: { supabaseService, openaiService } });
+
+  assert.deepEqual(result.sources, [{ fileName: 'Handbook.pdf', documentId: 'doc-1' }]);
+});
+
+test('a missing Cited line (non-compliant model output) falls back to the full retrieved set, matching pre-fix behavior', async () => {
+  const supabaseService = createFakeSupabaseService();
+  supabaseService.searchChunksWithTitleBoost = async () => ({
+    chunks: [
+      { document_id: 'doc-1', similarity: 0.9, metadata: { fileName: 'A.pdf' } },
+      { document_id: 'doc-2', similarity: 0.2, metadata: { fileName: 'B.pdf' } },
+    ],
+    matchedDocumentIds: [],
+  });
+  const openaiService = createFakeOpenaiService({ ragAnswer: 'Answer with no Cited line at all.\n\nSource: A.pdf' });
+
+  const result = await runKnowledgeQuery({ clientId: CLIENT_ID, question: 'q', origin: 'portal', deps: { supabaseService, openaiService } });
+
+  assert.equal(result.sources.length, 2);
 });
 
 test('no chunks found returns a knowledge-gap result with gapReason no_chunks_found, and auto-persists a system-reported gap', async () => {
@@ -588,6 +669,7 @@ function createScriptedToolOpenaiService({ intent, ragAnswer = 'stored-only answ
       receivedToolResults.push(toolResult);
       return nextResult(tools);
     },
+    extractCitedIndices,
   };
 }
 

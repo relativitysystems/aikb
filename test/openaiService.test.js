@@ -20,7 +20,7 @@ process.env.GLOBAL_SUPABASE_SERVICE_KEY = process.env.GLOBAL_SUPABASE_SERVICE_KE
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildContextText, formatCitationDate } = require('../services/openaiService');
+const { buildContextText, formatCitationDate, extractCitedIndices } = require('../services/openaiService');
 
 // ─────────────────────────────────────────────
 // formatCitationDate
@@ -38,6 +38,15 @@ test('formatCitationDate returns null for a null/undefined/empty input, never th
 
 test('formatCitationDate returns null for an unparseable string rather than "Invalid Date"', () => {
   assert.equal(formatCitationDate('not-a-date'), null);
+});
+
+// EM10.5 Scenario 2 bug fix — pinned to UTC so a timestamp near a
+// timezone boundary formats deterministically regardless of the host
+// process's local timezone (this is what previously caused this file's
+// citation date to disagree with portalCitations.js's browser-side one).
+test('formatCitationDate is pinned to UTC, not the host process\'s local timezone', () => {
+  assert.equal(formatCitationDate('2026-08-04T23:30:00Z'), 'Aug 4, 2026');
+  assert.equal(formatCitationDate('2026-08-05T00:30:00Z'), 'Aug 5, 2026');
 });
 
 // ─────────────────────────────────────────────
@@ -105,4 +114,48 @@ test('buildContextText: an email chunk NEVER falls into the fileName/page branch
   }]);
   assert.doesNotMatch(text, /stale\.txt/);
   assert.match(text, /Email — "Renewal"/);
+});
+
+// ─────────────────────────────────────────────
+// extractCitedIndices — EM10.5 Scenario 2 bug fix: parses the model's
+// trailing "Cited: [n, n]" line so runKnowledgeQuery.js can filter its
+// sources[] array down to only what was actually cited.
+// ─────────────────────────────────────────────
+
+test('extractCitedIndices parses a well-formed Cited line and strips it from the returned answer', () => {
+  const answer = 'TL;DR\nSome answer.\n\nSource: Weekly Sales Meeting Agenda.txt\nCited: [2]';
+  const { citedIndices, cleanedAnswer } = extractCitedIndices(answer);
+  assert.deepEqual([...citedIndices], [2]);
+  assert.doesNotMatch(cleanedAnswer, /Cited/);
+  assert.match(cleanedAnswer, /Source: Weekly Sales Meeting Agenda\.txt/);
+});
+
+test('extractCitedIndices parses multiple indices', () => {
+  const { citedIndices } = extractCitedIndices('Answer.\n\nSource: A, B\nCited: [1, 3]');
+  assert.deepEqual([...citedIndices].sort(), [1, 3]);
+});
+
+test('extractCitedIndices returns an empty set and the answer unchanged when Cited is explicitly empty', () => {
+  const answer = 'Answer.\n\nSource: N/A\nCited: []';
+  const { citedIndices, cleanedAnswer } = extractCitedIndices(answer);
+  assert.equal(citedIndices.size, 0);
+  assert.doesNotMatch(cleanedAnswer, /Cited/);
+});
+
+test('extractCitedIndices returns an empty set and the answer byte-for-byte unchanged when no Cited line is present (DI-faked fixtures, non-compliant model output)', () => {
+  const answer = 'Answer.\n\nSource: Handbook.pdf';
+  const { citedIndices, cleanedAnswer } = extractCitedIndices(answer);
+  assert.equal(citedIndices.size, 0);
+  assert.equal(cleanedAnswer, answer);
+});
+
+test('extractCitedIndices ignores non-numeric/out-of-range garbage inside the brackets rather than throwing', () => {
+  const { citedIndices } = extractCitedIndices('Answer.\n\nCited: [1, abc, 0, -3, 2]');
+  assert.deepEqual([...citedIndices].sort(), [1, 2]);
+});
+
+test('extractCitedIndices never throws on a non-string input', () => {
+  const { citedIndices, cleanedAnswer } = extractCitedIndices(null);
+  assert.equal(citedIndices.size, 0);
+  assert.equal(cleanedAnswer, null);
 });

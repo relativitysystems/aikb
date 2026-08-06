@@ -30,6 +30,7 @@ When information is missing, incomplete, outdated, or conflicting, clearly state
 - If the answer is not clearly documented, say: "This is not fully documented in our knowledge base." Then state what was found and recommend the smallest next step.
 - If the answer is supported by information in the retrieved context, cite the source document(s) using: Source: filename for non-paginated documents, or Source: filename, p. X when a page number is present in the retrieved context. Never invent a page number.
 - If the question is not documented, missing, or cannot be answered from the retrieved context, do NOT cite a retrieved document as if it supports the answer. Use: Source: N/A
+- After the Source line, add one final line, exactly in this form: Cited: [n, n] — listing ONLY the bracket numbers of the numbered context items above (e.g. [1], [2]) whose content you actually relied on to write this answer. Never include a number for a context item that was retrieved but not used. Use Cited: [] when Source is N/A.
 - If documents disagree, present both versions and recommend confirmation with the appropriate owner.
 
 ## Style
@@ -54,7 +55,8 @@ When information is missing, incomplete, outdated, or conflicting, clearly state
 TL;DR
 Guidance
 Next Step
-Source`;
+Source
+Cited`;
 
 // ---------------------------------------------------------------------------
 // Embeddings
@@ -147,11 +149,16 @@ async function embedQuery(text) {
 // entry's display. Deliberately does not throw on a bad/missing value —
 // context-block formatting must never fail a whole answer over one
 // malformed timestamp.
+// EM10.5 Scenario 2 bug fix: pinned to UTC so this always agrees with
+// Relativity/public/portal/portalCitations.js's identical function — before
+// this, each defaulted to its own runtime's local timezone (this file's
+// Node process vs. the visitor's browser), so the same sent_at instant near
+// a timezone boundary could format to different calendar dates on each side.
 function formatCitationDate(isoString) {
   if (!isoString) return null;
   const d = new Date(isoString);
   if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
 }
 
 /**
@@ -182,6 +189,40 @@ function buildContextText(contextChunks) {
       return `[${i + 1}] Source: ${source}${page}\n${c.content}`;
     })
     .join('\n\n---\n\n');
+}
+
+// EM10.5 Scenario 2 bug fix — buildContextText's numbered `[i] Source: ...`
+// blocks let the model tell us exactly which retrieved chunks it actually
+// relied on, via a final "Cited: [n, n]" line (RAG_SYSTEM_PROMPT's Response
+// Format, above). runKnowledgeQuery.js uses the returned indices to filter
+// its structured sources[] array down to only those documents, instead of
+// returning every retrieved candidate regardless of whether the model used
+// it. This function only parses — it has no knowledge of how many chunks
+// were actually retrieved, so the caller must still validate each index
+// against its own contextChunks array before trusting it (never assume a
+// model-reported index is in range). Returns an empty citedIndices Set, and
+// the answer unchanged, when no parseable "Cited:" line is found at all
+// (e.g. a DI-faked test fixture, or a model that didn't comply) — callers
+// treat that as "unknown," not "cited nothing," and should fall back to
+// their pre-fix behavior rather than hiding every source.
+const CITED_LINE_RE = /^[ \t]*Cited\s*:\s*\[([^\]]*)\][ \t]*$/im;
+
+function extractCitedIndices(answerText) {
+  if (typeof answerText !== 'string') {
+    return { citedIndices: new Set(), cleanedAnswer: answerText };
+  }
+  const match = answerText.match(CITED_LINE_RE);
+  if (!match) {
+    return { citedIndices: new Set(), cleanedAnswer: answerText };
+  }
+  const citedIndices = new Set(
+    match[1]
+      .split(',')
+      .map((s) => parseInt(s.trim(), 10))
+      .filter((n) => Number.isInteger(n) && n >= 1)
+  );
+  const cleanedAnswer = answerText.replace(CITED_LINE_RE, '').replace(/\n{3,}/g, '\n\n').trimEnd();
+  return { citedIndices, cleanedAnswer };
 }
 
 /**
@@ -710,4 +751,5 @@ module.exports = {
   buildNonRetrievalAnswer,
   buildContextText,
   formatCitationDate,
+  extractCitedIndices,
 };
