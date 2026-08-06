@@ -447,7 +447,14 @@ async function markDocumentDeleted(clientId, documentId) {
   const { supabase } = await getAikbDatabase(clientId);
   const { error } = await supabase
     .from('knowledge_documents')
-    .update({ status: 'deleted', updated_at: new Date().toISOString() })
+    // content_hash is cleared alongside status (EM10.5 Scenario 3 bug fix,
+    // defense in depth): status='deleted' is the single source of truth for
+    // "this document is gone," but a stale content_hash left on a deleted
+    // row previously let a same-content re-ingest's hash comparison match it
+    // and wrongly skip re-indexing (see services/ingestDedup.js). Nulling it
+    // here means that shortcut can never match again, even if the ingest
+    // pipeline's own status/chunk check ever regressed.
+    .update({ status: 'deleted', content_hash: null, updated_at: new Date().toISOString() })
     .eq('id', documentId);
   if (error) throw new Error(`markDocumentDeleted: ${error.message}`);
 }
@@ -654,6 +661,20 @@ async function deleteChunksForDocument(clientId, documentId) {
   console.log(`[deleteChunksForDocument] END | docId=${documentId} | elapsed=${Date.now() - start}ms`);
 
   return data;
+}
+
+// EM10.5 Scenario 3 bug fix — lets the ingest pipeline's unchanged-hash skip
+// verify a document is actually still indexed (not just hash-equal) before
+// trusting it. See services/ingestDedup.js#canSkipUnchangedHash, the caller.
+async function getChunkCountForDocument(clientId, documentId) {
+  const { supabase } = await getAikbDatabase(clientId);
+  const { count, error } = await supabase
+    .from('knowledge_chunks')
+    .select('*', { count: 'exact', head: true })
+    .eq('client_id', clientId)
+    .eq('document_id', documentId);
+  if (error) throw new Error(`getChunkCountForDocument: ${error.message}`);
+  return count ?? 0;
 }
 
 async function insertKnowledgeChunks(clientId, chunks) {
@@ -1509,6 +1530,7 @@ module.exports = {
   deleteCollection,
   moveDocumentCollection,
   deleteChunksForDocument,
+  getChunkCountForDocument,
   insertKnowledgeChunks,
   searchChunks,
   hasIndexedDocuments,

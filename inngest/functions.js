@@ -7,6 +7,7 @@ const supabaseService = require('../services/supabaseService');
 const openaiService = require('../services/openaiService');
 const documentParser = require('../services/documentParser');
 const chunkService = require('../services/chunkService');
+const { canSkipUnchangedHash } = require('../services/ingestDedup');
 const { runKnowledgeQuery } = require('../services/runKnowledgeQuery');
 const relativityDeliverClient = require('../services/relativityDeliverClient');
 const relativityTickClient = require('../services/relativityTickClient');
@@ -149,8 +150,18 @@ const ingestDocument = inngest.createFunction(
           // Content hash
           const contentHash = crypto.createHash('sha256').update(parsedText).digest('hex');
 
-          // Unchanged hash — skip if same content re-uploaded (uses `existing` from outer step closure)
-          if (existing && existing.content_hash === contentHash && !forceReindex) {
+          // Unchanged hash — skip if same content re-uploaded (uses `existing` from
+          // outer step closure). EM10.5 Scenario 3 bug fix: a hash match alone is not
+          // enough — a document that was deleted (status='deleted', chunks removed)
+          // and re-submitted with unchanged content must NOT be skipped, or it stays
+          // "imported" but permanently unsearchable (see services/ingestDedup.js).
+          // The chunk-count round trip only runs when the cheap synchronous checks
+          // (hash equality, status === 'indexed') already pass.
+          const hashAndStatusMatch = !forceReindex && existing && existing.content_hash === contentHash && existing.status === 'indexed';
+          const existingChunkCount = hashAndStatusMatch
+            ? await supabaseService.getChunkCountForDocument(clientId, existing.id)
+            : 0;
+          if (canSkipUnchangedHash({ existing, contentHash, forceReindex, chunkCount: existingChunkCount })) {
             console.log(`[ingest] SKIP unchanged hash | ${tag(jobId, sourceFileId, null)}`);
             await supabaseService.updateIngestionJob(clientId, job.id, { status: 'completed', documentId: existing.id });
             return { skipped: true, reason: 'content hash unchanged', documentId: existing.id, chunkCount: 0, pageCount, contentHash };
