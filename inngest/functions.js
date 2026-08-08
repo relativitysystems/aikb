@@ -8,6 +8,7 @@ const openaiService = require('../services/openaiService');
 const documentParser = require('../services/documentParser');
 const chunkService = require('../services/chunkService');
 const { canSkipUnchangedHash } = require('../services/ingestDedup');
+const { resolveDocumentCollectionId } = require('../services/collectionResolution');
 const { runKnowledgeQuery } = require('../services/runKnowledgeQuery');
 const relativityDeliverClient = require('../services/relativityDeliverClient');
 const relativityTickClient = require('../services/relativityTickClient');
@@ -185,16 +186,29 @@ const ingestDocument = inngest.createFunction(
             }
           }
 
-          // Upsert document record. collectionId is only resolved/passed on
-          // a true first-insert (existing is falsy here) — a reindex of an
-          // already-moved document must never reset its collection back to
-          // General (see upsertKnowledgeDocument's "only write when truthy"
-          // handling of this param). EM6: an explicit collectionId from the
-          // caller (a matched email_ingestion_rules.destination_collection_id,
-          // §22) takes priority over the default collection.
+          // Upsert document record. collection_id must always be resolved to
+          // a concrete value here — never left undefined for an existing row
+          // — because upsertKnowledgeDocument's upsert only writes the
+          // column when it's truthy, and Postgres's INSERT ... ON CONFLICT
+          // DO UPDATE validates NOT NULL constraints against the candidate
+          // INSERT row before it ever resolves the conflict, so an omitted
+          // collection_id fails even on a re-ingest of a row that already
+          // has one (EM10.5 Scenario 3 follow-up bug, see
+          // services/collectionResolution.js for the full explanation).
+          // EM6: an explicit collectionId from the caller (a matched
+          // email_ingestion_rules.destination_collection_id, §22) always
+          // takes priority, including on re-ingest.
+          const collectionResolution = resolveDocumentCollectionId({ existing, collectionId });
           let newDocCollectionId;
-          if (!existing) {
-            newDocCollectionId = collectionId || (await supabaseService.getDefaultCollection(clientId)).id;
+          if (collectionResolution.source === 'default') {
+            newDocCollectionId = (await supabaseService.getDefaultCollection(clientId)).id;
+          } else if (collectionResolution.source === 'error') {
+            throw new Error(
+              `[ingest] Cannot resolve collection_id for existing document ${existing.id} ` +
+              `(${sourceProvider}:${sourceFileId}) — the row has no collection_id and none was supplied`
+            );
+          } else {
+            newDocCollectionId = collectionResolution.collectionId;
           }
           const doc = await supabaseService.upsertKnowledgeDocument(
             clientId, sourceProvider, sourceFileId, fileName, resolvedMimeType, contentHash,
